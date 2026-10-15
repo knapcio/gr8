@@ -1,7 +1,7 @@
 #!/bin/bash
 # Host-only tests (g++, no CUDA): the switchless relay's ring and credit accounting, the S2 batch planner
-# (engine/runtime/s2_batch.h, with a DFlash2 session and the insert rule), the S2 control barrier, the pool's page lists
-# and prefix reuse (s2/pool.h over the Rust pool in engine/kvman-rs, and pool_diff_test: that pool against the C++ one
+# (engine/runtime/s2_batch.h, with a DFlash2 session, the insert rule and the MTP confidence stop), the S2 control
+# barrier, the pool's page lists and prefix reuse (s2/pool.h over the Rust pool in engine/kvman-rs, and pool_diff_test: that pool against the C++ one
 # it replaced), runs that grow on demand through Driver::step (driver_grow_test, with insert rules), the scheduler's
 # prefill choice and its deferral bound (scheduler_fair_test), its notice target's sizing (scheduler_horizon_test),
 # the pool's block
@@ -30,6 +30,8 @@ g++ -std=c++17 -O2 -Wall -I "$REPO/engine/runtime" "$REPO/engine/runtime/s2/test
 "$T/batch_dsel_test"
 g++ -std=c++17 -O2 -Wall -I "$REPO/engine/runtime" "$REPO/engine/runtime/s2/tests/batch_insert_test.cpp" -o "$T/batch_insert_test"
 "$T/batch_insert_test"
+g++ -std=c++17 -O2 -Wall -I "$REPO/engine/runtime" "$REPO/engine/runtime/s2/tests/batch_kstop_test.cpp" -o "$T/batch_kstop_test"
+"$T/batch_kstop_test"
 g++ -std=c++17 -O2 -Wall -pthread -I "$REPO/engine/runtime" "$REPO/engine/runtime/s2/tests/capture_barrier_test.cpp" -o "$T/capture_barrier_test"
 "$T/capture_barrier_test"
 g++ -std=c++17 -O2 -Wall -I "$REPO/engine/runtime" "$REPO/engine/runtime/s2/tests/pool_reuse_test.cpp" "${KVLIB[@]}" -o "$T/pool_reuse_test"

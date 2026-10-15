@@ -269,6 +269,42 @@ int main(int argc, char** argv)
     }
     if (s2mode && (!graph || !mtp || !MP || s2port < 1 || s2port > 65535 || s2sess < 1 || s2sess > 8 || !s2epoch))
         die("serving (--serve) needs --graph, --mtp, --prefill, --s2-port 1..65535, --s2-sessions 1..8 and --s2-epoch > 0");
+    // G6_MTP_KSTOP=1|2 (s2_batch.h KStop; default 0): a solo DFlash2 session's MTP rounds draft and verify 1..
+    // G6_MTP_KSTOP_KMAX (1..3, default --mtp) drafts, chosen from the drafts' log-probabilities: 1 by G6_MTP_KSTOP_TAU=
+    // t1,t2,t3 (draft j while p_1 * .. * p_j >= t_j; default 0,0.2,0.5), 2 by the drafter choice's MTP estimates
+    // (G6_MTP_KSTOP_SEED3: their prior for a third draft). G6_MTP_LPLOG=1 (rank 0; 2: every rank): one "# kstop" line per
+    // solo round, nothing else changes. The policy is in the S2 runtime signature
+    s2::KStop kstop;
+    {
+        std::string ke;
+        kstop.mode = env_choice("G6_MTP_KSTOP", 2, 0, &ke);
+        const int lplog = env_choice("G6_MTP_LPLOG", 2, 0, &ke);
+        if (kstop.mode < 0 || lplog < 0) die(ke);
+        kstop.log = lplog == 2 || (lplog == 1 && cfg.rank == 0);
+        kstop.kmax = getenv("G6_MTP_KSTOP_KMAX") ? atoi(getenv("G6_MTP_KSTOP_KMAX")) : mtp;
+        if (const char* e = getenv("G6_MTP_KSTOP_TAU"))
+        {
+            std::vector<double> t;
+            std::string v = e;
+            for (size_t a = 0; a <= v.size();)
+            {
+                const size_t b = std::min(v.find(',', a), v.size());
+                char* end = nullptr;
+                const std::string f = v.substr(a, b - a);
+                t.push_back(strtod(f.c_str(), &end));
+                if (f.empty() || *end || !std::isfinite(t.back())) die("G6_MTP_KSTOP_TAU=t1[,t2[,t3]]: numbers");
+                a = b + 1;
+            }
+            if (t.size() > 3) die("G6_MTP_KSTOP_TAU: at most 3 thresholds");
+            for (size_t j = 0; j < t.size(); ++j) kstop.tau[j + 1] = t[j];
+        }
+        if (const char* e = getenv("G6_MTP_KSTOP_SEED3")) kstop.seed3 = atof(e);
+        if (kstop.mode && (!s2mode || !dfl || mtp < 2 || kstop.kmax < 1 || kstop.kmax > 3 || !(kstop.seed3 > 0 && kstop.seed3 < 1) ||
+                           kstop.kmax + 1 > std::max(s2sess * (mtp + 1), plan.chunk)))
+            die("G6_MTP_KSTOP needs --serve, --dflash-manifest and --mtp 2+; G6_MTP_KSTOP_KMAX 1..3 (verify rows within a step's), "
+                "G6_MTP_KSTOP_SEED3 in (0, 1)");
+        if (!kstop.mode) kstop.kmax = 0;
+    }
     // --reuse-prefix: one conversation's caches (prefix_reuse.h), or under S2 every retired session's run (s2/pool.h).
     // The DFlash2 drafter's prompt-context taps (DF.pf_feat) are written by the prefill rows a hit skips.
     if (!kv_tiers.empty() && !(s2mode && reuse_prefix)) die("--kv-store needs --serve and --reuse-prefix (it keeps the runs prefix reuse retains)");
@@ -324,6 +360,11 @@ int main(int argc, char** argv)
         if (std::find(row_counts.begin(), row_counts.end(), mtp + 1) == row_counts.end()) row_counts.push_back(mtp + 1);
     }
     if (dfl && std::find(row_counts.begin(), row_counts.end(), dfl_k + 1) == row_counts.end()) row_counts.push_back(dfl_k + 1);
+    for (int M = 2; M <= kstop.kmax + 1; ++M)   // G6_MTP_KSTOP: solo MTP verifies of 2..kmax + 1 rows, first forms of as many
+    {
+        if (std::find(row_counts.begin(), row_counts.end(), M) == row_counts.end()) row_counts.push_back(M);
+        if (std::find(draft_rows.begin(), draft_rows.end(), M) == draft_rows.end()) draft_rows.push_back(M);
+    }
     for (int k : spec.levels)           // --spec-adaptive: a verify graph per level
         if (std::find(row_counts.begin(), row_counts.end(), k + 1) == row_counts.end()) row_counts.push_back(k + 1);
     const int NL = (int)layers.size(), NC = 2 * NL + 1, R = cfg.rank;
@@ -1179,6 +1220,13 @@ int main(int argc, char** argv)
                                                     h.dsel.m.draft_each);
                 if (R == 0 && h.dsel.on && h.dsel.start_mtp) fprintf(stderr, "# s2 drafter choice: requests start on MTP\n");
                 if (R == 0 && h.dsel.on && h.dsel.posclk) fprintf(stderr, "# s2 drafter choice: per-position clocks\n");
+                h.kstop = kstop;
+                if (R == 0 && kstop.mode)
+                    fprintf(stderr, "# s2 MTP confidence stop: mode %d, solo MTP rounds verify 1..%d drafts (%s)%s\n", kstop.mode, kstop.kmax,
+                            kstop.mode == 1 ? ("tau " + std::to_string(kstop.tau[1]) + "," + std::to_string(kstop.tau[2]) + "," +
+                                               std::to_string(kstop.tau[3])).c_str()
+                                            : ("MTP estimates, seed3 " + std::to_string(kstop.seed3)).c_str(),
+                            h.dsel.on ? "" : "; the drafter choice is off, so no MTP rounds");
                 // a 1-token prompt has no prefill: the drafter starts from its prompt step (dfl_lo = first, as plain)
                 h.dispatch.dfl_ok = [&](int q) { return dfl_owner == q || slot_prompt[q] == 1; };
                 h.dispatch.dfl_start = [&](int q) {    // the offline loop's fill steps: Dfl::pf_feat -> the ring
@@ -1233,7 +1281,9 @@ int main(int argc, char** argv)
                 (iq_split ? " idxqsplit 1" : "") + (mtp_split ? " mtpsplit 1" : "") +
                 (dhead.on ? " dheadi4 " + std::to_string(dhead.tpc) + "x" + std::to_string(dhead.ks) : "") +
                 (dfl_i4 ? " dflheadi4 " + std::to_string(dhead.tpc) + "x" + std::to_string(dhead.ks) : "") +
-                (dsel_start_mtp ? " dselstart mtp" : "") + (dsel_posclk ? " dselposclk 1" : "") + (dfl_alpha != 1.f ? " dflalpha " + std::to_string(dfl_alpha) : "");
+                (dsel_start_mtp ? " dselstart mtp" : "") + (dsel_posclk ? " dselposclk 1" : "") + (dfl_alpha != 1.f ? " dflalpha " + std::to_string(dfl_alpha) : "") +
+                (kstop.mode ? " kstop " + std::to_string(kstop.mode) + " kmax " + std::to_string(kstop.kmax) + " tau " + std::to_string(kstop.tau[1]) + "," +
+                              std::to_string(kstop.tau[2]) + "," + std::to_string(kstop.tau[3]) + " seed3 " + std::to_string(kstop.seed3) : "");
             fprintf(stderr, "# rank %d: s2 below R %d rows, pool %u logical / %d physical pages, %d sessions, epoch %llu, control %s:%d\n", R,
                     s2_below, sc.pool_rows / 64, place, s2sess, s2epoch, bc.head_ip.c_str(), s2port);
             g6s2::ControlLinks links = g6s2::bootstrap(bc);

@@ -27,6 +27,11 @@
 // needs no catch-up; every DSel::probe-th of them also drafts, and its 7 drafts are scored against the tokens later
 // rounds commit. On DFlash2 rounds the MTP first-form pass already drafts d[1], which scores MTP's first position. The
 // estimates start afresh with each request.
+// Confidence stop (Batch::kstop, G6_MTP_KSTOP): a solo DFlash2 session's MTP rounds draft and verify k <= KStop::kmax
+// MTP drafts, chosen from the drafts' log-probabilities under the MTP head (StepOut::lp, Hooks::lp): the chain stops
+// before a draft that could not be verified, and the verify takes the drafts that pass. The log-probabilities are the
+// same bytes on every rank (spec_len.h), so every rank chooses the same k. The verify's row count then varies 2..kmax+1
+// as a DFlash2 round's does. A demoted session's chain is completed to K before its first shared round.
 // Insert rule (Session::ins, insert_rule.h): the rule's tokens take the place of the reply's after+1-th token, when none
 // of the first after is `unless`. The verify's tokens after that one are dropped, as rejected drafts are. The inserted
 // tokens are committed and emitted at once. Their own steps (forced, below) run at the start of the session's next
@@ -39,6 +44,7 @@
 #pragma once
 #include <algorithm>
 #include <cmath>
+#include <cstdio>
 #include <functional>
 #include <stdexcept>
 #include <string>
@@ -123,6 +129,8 @@ struct Hooks
     // (the prefill's taps), returning the lowest position it holds
     std::function<DflDrafts(const DflReq&)> dfl;
     std::function<int(int)> dfl_start;
+    // optional: row r's log-probability in the last DRAFT or CHAIN step (StepOut::lp; Batch::kstop)
+    std::function<float(int)> lp;
 };
 
 // Persistent driver state for the scheduler: stable slots 0..S2N_SLOTS-1, all calls at round boundaries.
@@ -169,6 +177,22 @@ struct DSel
     bool posclk = false;              // G6_S2_DSEL_POSCLK=1: d and m keep a clock per position (SpecLen::posclk)
     g6rt::SpecLen d, m;               // DFlash2 and MTP estimates; draft_round / draft_each hold each round's drafting ms
 };
+// G6_MTP_KSTOP (every rank, read at boot; Batch::kstop): how many MTP drafts a solo DFlash2 session's MTP round verifies.
+//   0  off: K every round
+//   1  thresholds: draft j is verified while p_1 * .. * p_j >= tau[j] (p = exp(lp)), at least one; the chain stops at
+//      the first draft that could not pass (p_1 * .. * p_j < tau[j + 1])
+//   2  DSel's MTP estimates (DSel::m, levels 1..kmax): more() before each chain step, choose() at the verify
+// kmax (G6_MTP_KSTOP_KMAX, 1..3, default K) may exceed K: the solo path verifies with the plain build's graphs, which
+// cover every row count up to the prompt chunk. log (G6_MTP_LPLOG): one "# kstop" line per solo round (both drafters),
+// the drafts' log-probabilities and the accept count, for tuning tau offline; it changes nothing else.
+struct KStop
+{
+    int mode = 0;
+    int kmax = 0;                     // 0: K
+    double tau[4] = {0, 0, 0.2, 0.5};
+    double seed3 = 0.55;              // mode 2: MTP's prior acceptance of a third draft (SpecLen::seed, 0.70 for DFlash2)
+    bool log = false;
+};
 class Batch
 {
 public:
@@ -184,7 +208,7 @@ public:
             if (q < 0 || q >= S2N_SLOTS || st_[q].on) throw std::runtime_error("s2: admit: slot " + std::to_string(q) + " is out of range or in use");
             if (!prompt(q, ss[k]) || st_[q].force >= 0) continue;
             if (!st_[q].dfl) live.push_back(q);
-            else if (st_[q].mtp) chain({q}, {int(Step::TAIL)}, K_);   // DSel::start_mtp: d[2..K] for its first round
+            else if (st_[q].mtp) kchain(q, Step::TAIL);   // DSel::start_mtp: d[2..K] for its first round
         }
         std::vector<int> all;
         for (int q = 0; q < S2N_SLOTS; ++q) if (active(q)) all.push_back(q);
@@ -207,7 +231,17 @@ public:
     void adapt(bool on) { adapt_ = on; }
     // DFlash2 sessions verify up to kv of the 7 drafts; sl: the plain build's --spec-adaptive policy (sl.on = false: kv)
     void dflash(int kv, const g6rt::SpecLen& sl) { dkv_ = kv; dsl_ = sl; }
-    void dsel(const DSel& d) { sel_ = d; sel_.d.posclk = sel_.m.posclk = d.posclk; }
+    void dsel(const DSel& d) { sel_ = d; sel_.d.posclk = sel_.m.posclk = d.posclk; kstop(ks_); }
+    // solo MTP rounds' draft count (KStop; mode 2 sets DSel::m's levels and third-position seed, so call it after dsel)
+    void kstop(const KStop& k)
+    {
+        ks_ = k;
+        if (ks_.mode != 2) return;
+        std::vector<int> lv;
+        for (int j = 1; j <= kmax(); ++j) lv.push_back(j);
+        sel_.m.set_levels(lv);
+        sel_.m.seed[3] = ks_.seed3;
+    }
     // a second session is resident: every DFlash2 session goes to MTP (the K-1 chain steps), before the next round
     void demote()
     {
@@ -215,8 +249,10 @@ public:
             if (st_[q].dfl && active(q))
             {
                 st_[q].dfl = false;
-                // on MTP already: d[2..K] are drafted. Inserted tokens waiting for their steps: forced() chains them
+                // on MTP already: d[2..K] are drafted (KStop: d[2..k], the rest chained here). Inserted tokens waiting for
+                // their steps: forced() chains them
                 if (!st_[q].mtp && st_[q].force < 0) chain({q}, {int(Step::ROUND)}, K_);
+                else if (st_[q].k < K_ && st_[q].force < 0) chain({q}, {int(Step::ROUND)}, K_, st_[q].k);
                 st_[q].mtp = false;
             }
     }
@@ -314,14 +350,15 @@ private:
 
     // one round of solo DFlash2 session q (dflash.cuh dflash_sequence's round): verify k + 1 rows, accept, emit; then the
     // MTP first-form pass and the drafter step over the a + 1 accepted rows. On MTP (x.mtp, drafter choice) the round
-    // verifies the K MTP drafts, the drafter step takes the rows as context only, and the K-1 chain steps follow.
+    // verifies the K MTP drafts (KStop: kverify of the x.k drafted), the drafter step takes the rows as context only, and
+    // the K-1 chain steps follow (KStop: kchain).
     void round_dfl(int q)
     {
         St& x = st_[q];
         const int base = (int)x.tokens.size() - 1;
         const bool m = x.mtp;
         double pe = 0;
-        const int k = m ? x.k : dsl_.on ? dsl_.choose(x.dl, dkv_, dkv_, &pe) : dkv_;
+        const int k = m ? (ks_.mode ? kverify(x, &pe) : x.k) : dsl_.on ? dsl_.choose(x.dl, dkv_, dkv_, &pe) : dkv_;
         const int* dr = m ? x.d.data() : x.dd;
         Step v;
         v.kind = Step::MAIN;
@@ -330,7 +367,7 @@ private:
         std::vector<Row> rows;
         for (int r = 0; r <= k; ++r) rows.push_back(Row{q, r ? dr[r] : x.tokens[base], base + r, base + r + 1, -1});
         add_rows(v, q, rows, v.event);
-        v.cls = row_class(m ? K_ + 1 : k + 1);
+        v.cls = row_class(m && !ks_.mode ? K_ + 1 : k + 1);
         check(v);
         const std::vector<int> t = h_.run(v);
         int a = 0;
@@ -338,7 +375,19 @@ private:
         int kept;
         const int c = commit(q, t.data(), a + 1, &kept);
         if (!m && dsl_.on) dsl_.observe(k, a, x.dl, pe);
-        if (sel_.on) score(x, k, a, t.data());
+        if (sel_.on) score(x, k, a, t.data(), pe);
+        if (ks_.log)
+        {   // G6_MTP_LPLOG: the verified drafts' log-probabilities (MTP: every drafted one), and MTP's d[1] with whether
+            // the target took it (t[0]); round = G6_S2_ROUNDLOG's round id
+            const int n = m ? x.k : k;
+            const float* lp = m ? x.dlm.data() : x.dl;
+            std::string l;
+            char b[48];
+            for (int j = 1; j <= n; ++j) { snprintf(b, sizeof b, "%s%.6g", j > 1 ? "," : "", lp[j]); l += b; }
+            fprintf(stderr, "# kstop round %ld slot %d n %ld %s base %d k %d nd %d a %d lp %s m1 %.6g m1ok %d pe %.3f hash %08x\n",
+                    cur_round_, q, stats_[q].rounds, m ? "mtp" : "dfl", base, k, n, a, l.c_str(), x.dlm[1], x.d[1] == t[0] ? 1 : 0, pe,
+                    g6rt::SpecLen::hash(lp, n, k));
+        }
         if (h_.round) h_.round(q, stats_[q].rounds, base, a, k);
         ++stats_[q].rounds; stats_[q].tokens += a + 1; ++stats_[q].acc[a]; stats_[q].drafted += k;
         ++x.rounds;
@@ -352,6 +401,7 @@ private:
         d.cls = row_class(d.M());
         check(d);
         x.d[1] = h_.run(d)[dn - 1];
+        x.dlm[1] = dlp(dn - 1);
         if (x.force >= 0)                 // the insert cut this round: the drafter takes the rows as context, forced() drafts
         {
             drafts(q, DflReq{q, dn, base, 0, x.lo, false});
@@ -366,7 +416,7 @@ private:
         drafts(q, DflReq{q, a + 1, base, t[a], x.lo, !nm || probe});
         if (probe) { x.pb = base + a + 1; std::copy(x.dd, x.dd + DFL_B, x.pd); std::copy(x.dl, x.dl + DFL_B, x.pl); }
         if (!nm) x.pb = -1;
-        if (nm) chain({q}, {int(v.event)}, K_);
+        if (nm) kchain(q, v.event);
     }
     void drafts(int q, const DflReq& r)
     {
@@ -379,6 +429,7 @@ private:
     {
         Session s;
         std::vector<int> tokens, d;
+        std::vector<float> dlm;           // KStop: d[j]'s log-probability under the MTP head (NaN: unknown)
         int n = 0;
         bool on = false, done = false;
         int rounds = 0; // first-step timer: per-session decode rounds; round 1 MAIN = DECODE1
@@ -395,18 +446,52 @@ private:
         int dd[DFL_B] = {};               // DFlash2 drafts d1..d7 and their log-probabilities under the drafter
         float dl[DFL_B] = {};
     };
+    // the chain of a solo session about to verify MTP drafts: K-1 steps, or with KStop while kmore() allows (x.k drafted)
+    void kchain(int q, int ev)
+    {
+        if (!ks_.mode) { chain({q}, {ev}, K_); return; }
+        St& x = st_[q];
+        int n = 1;
+        while (n < kmax() && kmore(x, n)) { chain({q}, {ev}, n + 1, n); ++n; }
+        x.k = n;
+    }
+    int kmax() const { return ks_.kmax ? ks_.kmax : K_; }
+    // KStop mode 1: the probability that drafts 1..j are all right, as the MTP head sees them (NaN, no lp hook: 1)
+    double kprob(const St& x, int j) const
+    {
+        double p = 1;
+        for (int i = 1; i <= j; ++i) p *= std::isnan(x.dlm[i]) ? 1.0 : std::exp((double)x.dlm[i]);
+        return p;
+    }
+    // KStop: one more chain step after n drafts (mode 1: draft n + 1 could still pass, and drafts 1..n do)
+    bool kmore(const St& x, int n) const
+    {
+        if (ks_.mode == 2) return sel_.m.more(x.dlm.data(), n);
+        for (int j = 1; j <= n; ++j) if (kprob(x, j) < ks_.tau[j]) return false;
+        return kprob(x, n) >= ks_.tau[n + 1];
+    }
+    // KStop: the drafts of x.d[1..x.k] to verify (at least one)
+    int kverify(const St& x, double* pe) const
+    {
+        if (ks_.mode == 2) return sel_.m.choose(x.dlm.data(), x.k, x.k, pe);
+        int k = 0;
+        while (k < x.k && kprob(x, k + 1) >= ks_.tau[k + 1]) ++k;
+        return std::max(k, 1);
+    }
+    float dlp(int row) const { return h_.lp && (ks_.mode || ks_.log) ? h_.lp(row) : NAN; }
     // drafter choice: teach the estimates what this round's tokens t[0..a] say about each drafter. DFlash2 rounds score
     // MTP's first draft (x.d[1], drafted for position base + 1 = t[0]); MTP rounds score a probe's DFlash2 drafts on the
     // positions the round committed
-    void score(St& x, int k, int a, const int* t)
+    void score(St& x, int k, int a, const int* t, double pe)
     {
+        const float* ml = ks_.mode ? x.dlm.data() : nullptr;   // KStop: MTP's estimates learn its confidence buckets
         if (!x.mtp)
         {
             sel_.d.observe(k, a, x.dl, 0);
-            sel_.m.observe(1, x.d[1] == t[0] ? 1 : 0, nullptr, 0);
+            sel_.m.observe(1, x.d[1] == t[0] ? 1 : 0, ml, 0);
             return;
         }
-        sel_.m.observe(k, a, nullptr, 0);
+        sel_.m.observe(k, a, ml, pe);
         probe_score(x);
     }
     // a probe's drafts pd[j] are for positions pb + j; score them once a mismatch or all DFL_B - 1 are committed
@@ -434,6 +519,7 @@ private:
     {
         g6rt::SpecLen f;
         f.on = o.on; f.levels = o.levels; f.draft_round = o.draft_round; f.draft_each = o.draft_each; f.posclk = o.posclk;
+        std::copy(o.seed, o.seed + g6rt::SpecLen::KX + 1, f.seed);
         return f;
     }
     // the draft count for the next round of sessions qs: the k with the most expected tokens per ms of the round
@@ -461,6 +547,7 @@ private:
     int dkv_ = DFL_B - 1;
     g6rt::SpecLen dsl_;
     DSel sel_;
+    KStop ks_;
     S2Cost cost_;
     std::vector<g6rt::SpecLen> sl_ = std::vector<g6rt::SpecLen>(S2N_SLOTS);
     long round_no_ = 0, cur_round_ = -1; // G6_S2_ROUNDLOG: id of the round in progress and its active-session count
@@ -489,12 +576,12 @@ private:
         for (int r = 0; r < M; ++r) v.push_back(Row{q, next[r], pos0 + r, pos0 + r + 2, -1});
         return v;
     }
-    // chain steps for the sessions in qs (each: base = its tokens.size() - 1; d[1] set; fills d[2..k])
-    void chain(const std::vector<int>& qs, const std::vector<int>& evs, int k)
+    // chain steps for the sessions in qs (each: base = its tokens.size() - 1; d[1..j0] set; fills d[j0+1..k])
+    void chain(const std::vector<int>& qs, const std::vector<int>& evs, int k, int j0 = 1)
     {
         for (int q : qs) st_[q].k = k;
         // first-step timer: each session's chain carries THAT session's round class (evs, parallel to qs).
-        for (int j = 1; j < k && !qs.empty(); ++j)
+        for (int j = j0; j < k && !qs.empty(); ++j)
         {
             Step s;
             s.kind = Step::CHAIN;
@@ -508,7 +595,7 @@ private:
             s.cls = row_class(s.M());
             check(s);
             const std::vector<int> t = h_.run(s);
-            for (size_t i = 0; i < s.sess.size(); ++i) st_[s.sess[i]].d[j + 1] = t[s.row0[i]];
+            for (size_t i = 0; i < s.sess.size(); ++i) { st_[s.sess[i]].d[j + 1] = t[s.row0[i]]; st_[s.sess[i]].dlm[j + 1] = dlp(s.row0[i]); }
         }
     }
     // the prompt steps of session q as its own steps (rank.cuh mtp_sequence, prompt loop); false = finished by emit
@@ -519,7 +606,8 @@ private:
         x.s = p; x.on = true;
         x.tokens = p.prompt;
         x.n = (int)p.prompt.size();
-        x.d.assign(K_ + 1, 0);
+        x.d.assign(std::max(K_, kmax()) + 1, 0);
+        x.dlm.assign(x.d.size(), NAN);
         sl_[q] = g6rt::SpecLen();
         stats_[q] = Stats();
         x.dfl = p.dflash;
@@ -564,6 +652,7 @@ private:
             check(d);
             const std::vector<int> u = h_.run(d);
             x.d[1] = u[M - 1];
+            x.dlm[1] = dlp(M - 1);
             const bool query = s == PS - 1 && x.force < 0;
             if (x.dfl) drafts(q, DflReq{q, M, rows[0].pos, query ? t[M - 1] : 0, x.lo, query});
             if (x.dfl && x.mtp && query) { x.pb = n; std::copy(x.dd, x.dd + DFL_B, x.pd); std::copy(x.dl, x.dl + DFL_B, x.pl); }
@@ -624,9 +713,11 @@ private:
             add_rows(d, q, draft_rows(q, M, p0, &x.tokens[p0 + 1]), ev);
             check(d);
             x.d[1] = h_.run(d)[M - 1];
+            x.dlm[1] = dlp(M - 1);
             if (x.dfl) drafts(q, DflReq{q, M, p0, last ? t[M - 1] : 0, x.lo, last});
         }
-        if (!x.dfl || x.mtp) chain({q}, {ev}, K_);
+        if (!x.dfl) chain({q}, {ev}, K_);
+        else if (x.mtp) kchain(q, ev);
     }
 };
 
