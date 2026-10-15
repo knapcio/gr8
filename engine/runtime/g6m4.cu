@@ -438,6 +438,10 @@ int main(int argc, char** argv)
               mtp_split = env_choice("G6_MTP_SPLIT", 1, 0, &qse);
     if (qs_mode < 0 || iq_split < 0 || mtp_split < 0) die(qse);
     if (mtp_split && !mtp) die("G6_MTP_SPLIT=1 needs --mtp");
+    // G6_DRAFT_HEAD_I4=1 (rank.cuh build_draft_head_i4; default 0): the MTP draft's head reads INT4 g32 records of the
+    // rank's vocab slice; the target's head is unchanged. In the S2 runtime signature with its split.
+    const DraftHeadI4 dhead = draft_head_i4_env();
+    if (dhead.on && !mtp) die("G6_DRAFT_HEAD_I4=1 needs --mtp");
     g6::Fabric fabg, fabdg;
     bool fabg_on = false, fabdg_on = false;
     auto qs_fabric = [&](g6::Fabric& fb, const Model& mm, int port_off, const char* what) {
@@ -652,6 +656,7 @@ int main(int argc, char** argv)
         G6RT_CK(cudaHostAlloc((void**)&out_d, sizeof(StepOut), cudaHostAllocMapped));
         if (mtp_split) { D.d.qs.mode = 1; D.d.qs.iq = true; D.d.qs.eh = true; }   // G6_MTP_SPLIT: eh_proj, q_a / kv_a / idx, idx_q
         build_draft(D, m, find, cap, fd, dmalloc<u64>(1), st, MP ? pf_attn_rows(MP) : MX);
+        build_draft_head_i4(D, dhead, st);
         if (D.d.qs.on())
         {
             qs_fabric(fabdg, D.d, 72, "G6_MTP_SPLIT");
@@ -1189,7 +1194,8 @@ int main(int argc, char** argv)
                 std::to_string(plan.chunk) + " cands " + std::to_string(nc) + " split 3 own " + std::to_string(pf_own) +
                 " qpctx " + std::to_string(pf_qp ? P.qp_ctx : 0) + " qpmin " + std::to_string(pf_qp ? pf_qp_min() : 0) +
                 (set_id.empty() ? "" : " set " + set_id) + (qs_mode ? " qasplit " + std::to_string(qs_mode) : "") +
-                (iq_split ? " idxqsplit 1" : "") + (mtp_split ? " mtpsplit 1" : "");
+                (iq_split ? " idxqsplit 1" : "") + (mtp_split ? " mtpsplit 1" : "") +
+                (dhead.on ? " dheadi4 " + std::to_string(dhead.tpc) + "x" + std::to_string(dhead.ks) : "");
             fprintf(stderr, "# rank %d: s2 below R %d rows, pool %u logical / %d physical pages, %d sessions, epoch %llu, control %s:%d\n", R,
                     s2_below, sc.pool_rows / 64, place, s2sess, s2epoch, bc.head_ip.c_str(), s2port);
             g6s2::ControlLinks links = g6s2::bootstrap(bc);
