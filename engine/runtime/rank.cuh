@@ -366,6 +366,7 @@ struct Model
     // vocab slice instead of head_t.lm_head (build_draft_head_i4); dh_tpc / dh_ks = its CTA split. nullptr = MXFP8
     const uint8_t* dh_i4 = nullptr;
     int dh_tpc = 1, dh_ks = 32;
+    bool eh_i4 = false;               // G6_MTP_EHPROJ_I4 (MTP draft model only, set before prepare): eh_proj on INT4 g32 records
     int nc = 0;                       // top_p candidates per rank per row (0 = top_p off); set before the first step
     unsigned* topp_miss = nullptr;    // device counter: top_p rows whose nucleus went past the candidates
     void (*dfl_tap)(Model&, int, int, cudaStream_t) = nullptr;   // --dflash: after layer i, copy the residual rows the drafter reads (dflash.cuh)
@@ -1276,6 +1277,36 @@ inline void route_log_line(FILE* f, const Model& m, const std::vector<int>& ids,
 
 inline const __nv_bfloat16* norm_after(const Model& m, int i) { return i + 1 < m.nl ? m.layers[i + 1].attn_norm : m.final_norm; }
 
+// G6_DFL_BODY_I4 / G6_MTP_EHPROJ_I4: a bound MXFP8 GEMV rebound to INT4 g32 records of the same rows (k_mx_to_i4 over
+// its O/16 tiles x K/32 groups, the G6_DRAFT_HEAD_I4 arithmetic; DEC_I4PAIR builds repack them for its ks): same split,
+// fragment table and output, only the weights' codec changes. One copy per (records, tiles, ks), so GEMVs that bind the
+// same records share it (the drafter's kv record: its context and block GEMVs; the MTP eh_proj of every row count).
+// Device memory for the life of the process; the MXFP8 records stay (they sit in the pack image). Returns the bytes made.
+inline size_t gv_to_i4(bind::Gv& g, const char* who, cudaStream_t st)
+{
+    struct Made { const uint8_t* mx; int tiles, ks; const uint8_t* i4; };
+    static std::vector<Made> made;
+    if (!g.on) return 0;
+    if (g.codec != bind::MXFP8) die(std::string(who) + ": a GEMV that is not on MXFP8 records");
+    const int tiles = g.O / 16, ng = g.K / 32;
+    for (const Made& x : made)
+        if (x.mx == g.w && x.tiles == tiles && x.ks == g.ks) { g.codec = bind::INT4; g.w = x.i4; return 0; }
+#if DEC_I4PAIR
+    if ((size_t)ng / g.ks * head_i4::I4GR > 48 * 1024) die(std::string(who) + ": k part too long for k_i4pair's shared memory");
+#endif
+    uint8_t* rec = dmalloc<uint8_t>(head_i4::bytes(tiles, ng));
+    head_i4::launch(g.w, rec, tiles, ng, st);
+    G6RT_CK(cudaGetLastError());
+#if DEC_I4PAIR
+    launch_i4pair(rec, tiles, ng, g.ks, st);   // make_gv kept ng % ks == 0
+    G6RT_CK(cudaGetLastError());
+#endif
+    G6RT_CK(cudaStreamSynchronize(st));
+    made.push_back(Made{g.w, tiles, g.ks, rec});
+    g.codec = bind::INT4; g.w = rec;
+    return head_i4::bytes(tiles, ng);
+}
+
 inline glue::HeadArgs head_args(Model& m, int M)
 {
     return glue::HeadArgs{m.f, m.stepp, 2 * m.nl, M, m.hlog, m.vn, m.vlo, m.vn, m.srow, m.tickets + 2 * m.nl, m.tok_out, m.lp,
@@ -1306,6 +1337,7 @@ inline const bind::Head& head_for(Model& m, int M)
             static const int tpc = getenv("G6_QA_SPLIT_TPC") ? atoi(getenv("G6_QA_SPLIT_TPC")) : 1;
             bind::narrow(H.eh, G.c0[m.rank][0] / 16, G.n[m.rank][0] / 16, tpc);
         }
+        if (m.eh_i4) gv_to_i4(H.eh, "G6_MTP_EHPROJ_I4", 0);   // after the narrow: this rank's tiles only
     }
     return H;
 }
@@ -1589,6 +1621,24 @@ inline void build_draft_head_i4(Draft& D, const DraftHeadI4& c, cudaStream_t st)
         if (d.head[M].M) die("G6_DRAFT_HEAD_I4: the draft head was bound before its INT4 records were made");
     d.dh_i4 = head_i4_records(d.head_t.lm_head, d.vn, c.ks, d.rank, "G6_DRAFT_HEAD_I4", st);
     d.dh_tpc = c.tpc; d.dh_ks = c.ks;
+}
+// G6_MTP_EHPROJ_I4=1 (default 0; needs --mtp): the MTP draft's eh_proj GEMV (78 MB MXFP8 per rank, or this rank's tiles
+// under G6_MTP_SPLIT: 19.5 MB) reads INT4 g32 records of the same rows (gv_to_i4), 288 / 528 of the bytes, on every draft
+// pass (first form and chain). Drafts only: the eh_proj of the draft prefill (prefill.cuh, the MTP layer's cache over the
+// prompt) and every target step keep MXFP8, so the committed tokens are the target's at any acceptance. Every rank
+// converts its own tiles by the same arithmetic. After build_draft_head_i4 (head_for binds the INT4 head with it), before
+// prepare: binds the one-row head here so the conversion runs at boot.
+inline void build_draft_eh_i4(Draft& D, bool on)
+{
+    Model& d = D.d;
+    if (!on) return;
+    for (int M = 1; M <= MX; ++M)
+        if (d.head[M].M) die("G6_MTP_EHPROJ_I4: the draft head was bound before its INT4 eh_proj");
+    if (!d.head_t.eh.p) die("G6_MTP_EHPROJ_I4: the draft model has no eh_proj");
+    d.eh_i4 = true;
+    const bind::Gv& g = head_for(d, 1).eh;
+    fprintf(stderr, "# rank %d: G6_MTP_EHPROJ_I4: eh_proj INT4 g32 records, %.1f MB (MXFP8 %.1f MB), %d outputs, ks %d\n", d.rank,
+            bind::gv_bytes(g) / 1e6, (double)(g.O / 16) * (g.K / 32) * head_i4::MXGR / 1e6, g.O, g.ks);
 }
 #ifdef DEC_S2
 inline const __half* s2_draft_hid(Draft& D, bool chain, cudaStream_t st);

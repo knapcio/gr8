@@ -491,6 +491,13 @@ int main(int argc, char** argv)
     const int dfl_i4 = env_choice("G6_DFL_HEAD_I4", 1, 0, &dfe);
     if (dfl_i4 < 0) die(dfe);
     if (dfl_i4 && !dfl) die("G6_DFL_HEAD_I4=1 needs --dflash-manifest");
+    // G6_DFL_BODY_I4=1 (dflash.cuh dfl_body_i4; default 0): the DFlash2 drafter's body GEMVs read INT4 g32 copies of their
+    // MXFP8 records. G6_MTP_EHPROJ_I4=1 (rank.cuh build_draft_eh_i4; default 0): the MTP draft's eh_proj does. Drafts only;
+    // +382 / +10.6 MB per rank (+42.5 without G6_MTP_SPLIT). Both in the S2 runtime signature
+    const int dfl_body_i4_on = env_choice("G6_DFL_BODY_I4", 1, 0, &dfe), eh_i4 = env_choice("G6_MTP_EHPROJ_I4", 1, 0, &dfe);
+    if (dfl_body_i4_on < 0 || eh_i4 < 0) die(dfe);
+    if (dfl_body_i4_on && !dfl) die("G6_DFL_BODY_I4=1 needs --dflash-manifest");
+    if (eh_i4 && !mtp) die("G6_MTP_EHPROJ_I4=1 needs --mtp");
     // G6_S2_DSEL_START=mtp (s2_batch.h DSel::start_mtp; default dflash): a DFlash2 request starts on MTP. In the S2 runtime
     // signature
     const char* dse = getenv("G6_S2_DSEL_START");
@@ -771,6 +778,7 @@ int main(int argc, char** argv)
             fabdg_on = true;
             qs_attach(D.d, fabdg.dev(), fd.error);   // the draft fabric's error word, which the draft step checks
         }
+        build_draft_eh_i4(D, eh_i4);
         D.d.graph = graph; D.d.in = in_d; D.d.out = out_d;
         DQ.P.attn_rows = pf_attn_rows(MP);
         if (MP) build_draft_prefill(DQ, D, find, MP, fp, pfv2, st, &P);
@@ -795,6 +803,7 @@ int main(int argc, char** argv)
         if (dfl_i4)
             dfl_head_i4(DF, D.d.dh_i4 ? D.d.dh_i4 : head_i4_records(m.head_t.lm_head, m.vn, dhead.ks, R, "G6_DFL_HEAD_I4", st),
                         dhead.tpc, dhead.ks);
+        if (dfl_body_i4_on) dfl_body_i4(DF, st);
         if (dfl_alpha != 1.f && !DF.sel) die("G6_DFL_SEL_ALPHA needs the selector walk");
         DF.sel_alpha = dfl_alpha;
         dfl_attach(m, DF);              // before the target graphs are captured: they carry the residual taps
@@ -1382,6 +1391,7 @@ int main(int argc, char** argv)
                 (iq_split ? " idxqsplit 1" : "") + (mtp_split ? " mtpsplit 1" : "") +
                 (dhead.on ? " dheadi4 " + std::to_string(dhead.tpc) + "x" + std::to_string(dhead.ks) : "") +
                 (dfl_i4 ? " dflheadi4 " + std::to_string(dhead.tpc) + "x" + std::to_string(dhead.ks) : "") +
+                (dfl_body_i4_on ? " dflbodyi4 1" : "") + (eh_i4 ? " ehi4 1" : "") +
                 (dsel_start_mtp ? " dselstart mtp" : "") + (dsel_posclk ? " dselposclk 1" : "") + (dfl_alpha != 1.f ? " dflalpha " + std::to_string(dfl_alpha) : "") +
                 (kstop.mode ? " kstop " + std::to_string(kstop.mode) + " kmax " + std::to_string(kstop.kmax) + " tau " + std::to_string(kstop.tau[1]) + "," +
                               std::to_string(kstop.tau[2]) + "," + std::to_string(kstop.tau[3]) + " seed3 " + std::to_string(kstop.seed3) : "") +

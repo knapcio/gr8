@@ -2,7 +2,8 @@
 # build the M4 drivers. usage: build_m4.sh <arch: 121a (DGX Spark GB10) | 120a (RTX 50xx)> [sim|g6|all|dfl|rs|tests]
 # tests: only the unit tests (tests/row_budget_test.cu, tests/s2_attn_test.cu) into $OUT; scripts/c1_tests.sh builds and runs them.
 # m4sim: one GPU, six simulated ranks. g6m4: one rank on the real fabric (needs libibverbs; Spark only).
-# dfl: dfltest only, the DFlash2 drafter step of all ranks on one GPU (engine/ref/dflash2_check.py).
+# dfl: dfltest and dflreplay only, the DFlash2 drafter step of all ranks on one GPU (engine/ref/dflash2_check.py; the
+#      G6_DFL_BODY_I4 replay of a G6_DFL_DUMP)
 # rs: rstest only, the head kernels of all ranks on one GPU: rejection sampling vs the target distribution.
 set -e
 cd "$(dirname "$0")"
@@ -32,7 +33,8 @@ nice -n 19 nvcc -O3 -std=c++17 $GEN -c ../attn/attn.cu -o $O/attn.o
 nice -n 19 nvcc -O3 -std=c++17 $GEN -c ../attn/bind.cu -o $O/attn_bind.o
 if [ "$WHAT" = dfl ]; then
   nice -n 19 nvcc -O2 -std=c++17 $GEN -o $OUT/dfltest dfltest.cu $O/attn.o $O/attn_bind.o $O/g6pack.o $O/devimage.o -lcublas -lpthread
-  ls -la $OUT/dfltest
+  nice -n 19 nvcc -O2 -std=c++17 $GEN -o $OUT/dflreplay dflreplay.cu $O/attn.o $O/attn_bind.o $O/g6pack.o $O/devimage.o -lcublas -lpthread
+  ls -la $OUT/dfltest $OUT/dflreplay
   exit 0
 fi
 # the Rust pack loader (engine/loader-rs, G6_RS_LOADER) when its library is built. scripts/build.sh builds it with cargo
