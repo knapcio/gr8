@@ -75,6 +75,10 @@ nvcc -O2 -std=c++17 -gencode=arch=compute_${ARCH:-121a},code=sm_${ARCH:-121a} -o
 # dense trellis matrices: build only. dtr_test runs on the release's files (engine/ref/dtr_ref.py)
 nvcc -O2 -std=c++17 -gencode=arch=compute_${ARCH:-121a},code=sm_${ARCH:-121a} $K1H2_FLAGS ${G6_NR:+-DG6_NR=$G6_NR} $S2_FLAG \
   -I "$REPO/engine/kernels" -o "$OUT/dtr_test" "$REPO/engine/kernels/tests/dtr_test.cu" -lcublas
+# G6_ROUTE_OVL (the shared expert on a forked stream during the router) against the default MoE layer: byte-exact check
+# + bench on a synthetic TP layer; build only (needs an idle GPU and ~2.5 GB): $OUT/k1_ovl_test (file header)
+nvcc -O2 -std=c++17 -gencode=arch=compute_${ARCH:-121a},code=sm_${ARCH:-121a} $K1H2_FLAGS ${G6_NR:+-DG6_NR=$G6_NR} $S2_FLAG \
+  -I "$REPO/engine/kernels" -o "$OUT/k1_ovl_test" "$REPO/engine/kernels/tests/k1_ovl_test.cu"
 if nvidia-smi -L > /dev/null 2>&1; then
   t=$("$OUT/tr3_e4m3_test") || { echo "$t"; echo "tr3_e4m3_test FAILED"; exit 1; }
   echo "tr3_e4m3_test: $(echo "$t" | tail -1)"
