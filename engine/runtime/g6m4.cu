@@ -1169,8 +1169,14 @@ int main(int argc, char** argv)
                 h.dsel.d.draft_round = 5.6 + 2.5;
                 h.dsel.m.draft_round = 2.5 + 3.0;
                 h.dsel.m.draft_each = 2.1;
-                if (R == 0 && h.dsel.on) fprintf(stderr, "# s2 drafter choice on: DFlash2 or MTP per round (dwell %d, margin %.2f, probe %d)\n",
-                                                    h.dsel.dwell, h.dsel.margin, h.dsel.probe);
+                // the drafting ms above, overridden (A/B of the cost model; every rank the same values)
+                if (const char* e = getenv("G6_S2_DSEL_DCOST")) h.dsel.d.draft_round = atof(e);
+                if (const char* e = getenv("G6_S2_DSEL_MCOST")) h.dsel.m.draft_round = atof(e);
+                if (const char* e = getenv("G6_S2_DSEL_MEACH")) h.dsel.m.draft_each = atof(e);
+                if (R == 0 && h.dsel.on) fprintf(stderr, "# s2 drafter choice on: DFlash2 or MTP per round (dwell %d, margin %.2f, probe %d, "
+                                                    "drafting ms: DFlash2 %.2f, MTP %.2f + %.2f per chain step)\n",
+                                                    h.dsel.dwell, h.dsel.margin, h.dsel.probe, h.dsel.d.draft_round, h.dsel.m.draft_round,
+                                                    h.dsel.m.draft_each);
                 if (R == 0 && h.dsel.on && h.dsel.start_mtp) fprintf(stderr, "# s2 drafter choice: requests start on MTP\n");
                 if (R == 0 && h.dsel.on && h.dsel.posclk) fprintf(stderr, "# s2 drafter choice: per-position clocks\n");
                 // a 1-token prompt has no prefill: the drafter starts from its prompt step (dfl_lo = first, as plain)
