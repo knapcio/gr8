@@ -166,6 +166,7 @@ struct DSel
     // G6_S2_DSEL_START=mtp: a request starts on MTP and the drafter's prompt-tail drafts are its first probe (default:
     // it starts on DFlash2)
     bool start_mtp = false;
+    bool posclk = false;              // G6_S2_DSEL_POSCLK=1: d and m keep a clock per position (SpecLen::posclk)
     g6rt::SpecLen d, m;               // DFlash2 and MTP estimates; draft_round / draft_each hold each round's drafting ms
 };
 class Batch
@@ -206,7 +207,7 @@ public:
     void adapt(bool on) { adapt_ = on; }
     // DFlash2 sessions verify up to kv of the 7 drafts; sl: the plain build's --spec-adaptive policy (sl.on = false: kv)
     void dflash(int kv, const g6rt::SpecLen& sl) { dkv_ = kv; dsl_ = sl; }
-    void dsel(const DSel& d) { sel_ = d; }
+    void dsel(const DSel& d) { sel_ = d; sel_.d.posclk = sel_.m.posclk = d.posclk; }
     // a second session is resident: every DFlash2 session goes to MTP (the K-1 chain steps), before the next round
     void demote()
     {
@@ -432,7 +433,7 @@ private:
     static g6rt::SpecLen fresh(const g6rt::SpecLen& o)
     {
         g6rt::SpecLen f;
-        f.on = o.on; f.levels = o.levels; f.draft_round = o.draft_round; f.draft_each = o.draft_each;
+        f.on = o.on; f.levels = o.levels; f.draft_round = o.draft_round; f.draft_each = o.draft_each; f.posclk = o.posclk;
         return f;
     }
     // the draft count for the next round of sessions qs: the k with the most expected tokens per ms of the round
