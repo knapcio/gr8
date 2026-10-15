@@ -93,6 +93,7 @@ the short version.
 | `G6_S2_ADAPT` | 0 | S2: choose each round's MTP draft count (1..k) from the sessions' accept rates and the S2 step costs; 1 adds ~1 GiB of main-step graphs |
 | `G6_S2_GROW` | 1 | S2: a session below R holds the KV pages it needs now and takes more as its output grows, admitted and grown only while every live session can still reach prompt + `max_tokens` + guard; a session that cannot grow sits out rounds. 0 = every run holds that worst case from admission |
 | `G6_S2_DSEL` | 1 | S2 with DFlash2: a request that decodes alone drafts each round with DFlash2 or MTP, whichever is expected to commit more tokens per ms (prose +4.5% on RigMark, code level); 0 = DFlash2 every round. `G6_S2_DSEL_MARGIN` (0.15), `G6_S2_DSEL_DWELL` (8 rounds) and `G6_S2_DSEL_PROBE` (4) tune it |
+| `G6_S2_DSEL_START` | dflash | S2 drafter choice: `mtp` = a DFlash2 request starts on MTP (the drafter's prompt-tail drafts are its first probe) and moves to DFlash2 when the evidence says so. Every rank must set the same value |
 | `G6_DEC_EVPROF` | unset | measurement: N = per-stage decode step times from event nodes in the captured main-step graphs, printed every N main steps (rank logs) |
 | `G6_DEC_PROF` | unset | measurement, plain launches only: the same stages with a synchronize at every mark |
 | `G6_DFL_PFCTX` | 1 | `--dflash`: 0 = no prompt context from the prefill (measurement); the drafter then starts from the last prompt token |

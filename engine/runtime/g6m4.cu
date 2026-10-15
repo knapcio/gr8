@@ -448,6 +448,11 @@ int main(int argc, char** argv)
     const int dfl_i4 = env_choice("G6_DFL_HEAD_I4", 1, 0, &dfe);
     if (dfl_i4 < 0) die(dfe);
     if (dfl_i4 && !dfl) die("G6_DFL_HEAD_I4=1 needs --dflash-manifest");
+    // G6_S2_DSEL_START=mtp (s2_batch.h DSel::start_mtp; default dflash): a DFlash2 request starts on MTP. In the S2 runtime
+    // signature
+    const char* dse = getenv("G6_S2_DSEL_START");
+    const bool dsel_start_mtp = dse && !strcmp(dse, "mtp");
+    if (dse && *dse && !dsel_start_mtp && strcmp(dse, "dflash")) die("G6_S2_DSEL_START: mtp or dflash");
     g6::Fabric fabg, fabdg;
     bool fabg_on = false, fabdg_on = false;
     auto qs_fabric = [&](g6::Fabric& fb, const Model& mm, int port_off, const char* what) {
@@ -1147,11 +1152,13 @@ int main(int argc, char** argv)
                 if (const char* e = getenv("G6_S2_DSEL_MARGIN")) h.dsel.margin = atof(e);
                 if (const char* e = getenv("G6_S2_DSEL_DWELL")) h.dsel.dwell = std::max(1, atoi(e));
                 if (const char* e = getenv("G6_S2_DSEL_PROBE")) h.dsel.probe = std::max(1, atoi(e));
+                h.dsel.start_mtp = dsel_start_mtp;
                 h.dsel.d.draft_round = 5.6 + 2.5;
                 h.dsel.m.draft_round = 2.5 + 3.0;
                 h.dsel.m.draft_each = 2.1;
                 if (R == 0 && h.dsel.on) fprintf(stderr, "# s2 drafter choice on: DFlash2 or MTP per round (dwell %d, margin %.2f, probe %d)\n",
                                                     h.dsel.dwell, h.dsel.margin, h.dsel.probe);
+                if (R == 0 && h.dsel.on && h.dsel.start_mtp) fprintf(stderr, "# s2 drafter choice: requests start on MTP\n");
                 // a 1-token prompt has no prefill: the drafter starts from its prompt step (dfl_lo = first, as plain)
                 h.dispatch.dfl_ok = [&](int q) { return dfl_owner == q || slot_prompt[q] == 1; };
                 h.dispatch.dfl_start = [&](int q) {    // the offline loop's fill steps: Dfl::pf_feat -> the ring
@@ -1205,7 +1212,8 @@ int main(int argc, char** argv)
                 (set_id.empty() ? "" : " set " + set_id) + (qs_mode ? " qasplit " + std::to_string(qs_mode) : "") +
                 (iq_split ? " idxqsplit 1" : "") + (mtp_split ? " mtpsplit 1" : "") +
                 (dhead.on ? " dheadi4 " + std::to_string(dhead.tpc) + "x" + std::to_string(dhead.ks) : "") +
-                (dfl_i4 ? " dflheadi4 " + std::to_string(dhead.tpc) + "x" + std::to_string(dhead.ks) : "");
+                (dfl_i4 ? " dflheadi4 " + std::to_string(dhead.tpc) + "x" + std::to_string(dhead.ks) : "") +
+                (dsel_start_mtp ? " dselstart mtp" : "");
             fprintf(stderr, "# rank %d: s2 below R %d rows, pool %u logical / %d physical pages, %d sessions, epoch %llu, control %s:%d\n", R,
                     s2_below, sc.pool_rows / 64, place, s2sess, s2epoch, bc.head_ip.c_str(), s2port);
             g6s2::ControlLinks links = g6s2::bootstrap(bc);
