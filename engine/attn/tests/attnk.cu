@@ -1,5 +1,5 @@
 // attnk: exact decode attention kernel arms against the stock decode attention chain of one layer, as the engine replays it
-// (g6_attn_replay_run captured in a CUDA graph). Harness = attnmk's (claude/attnmk engine/attn/tests/attnmk.cu) without the MK
+// (g6_attn_replay_run captured in a CUDA graph). Harness = an earlier attention-chain bench (attnmk) without the MK
 // chain kernel. Flags under test (each a host-side static the bench assigns): G6_ATTN_SC2 / _SC2_TR (scores_sc), G6_ATTN_CTX2
 // (context_parts_heads PB / context_pk), G6_ATTN_CTX3 / _CTX3_HG (context_pk3), G6_ATTN_SEL2 (rank_selected), G6_IDX_GRP
 // (index_scores_g).
@@ -17,7 +17,7 @@
 //           rows and index pages, per layer the raw scores (chain prefix through the scores node) and the context parts
 //           (prefix through the context node), the shared layer's normalized probabilities and merged context. Captured
 //           once, before any arm is touched.
-//   BASE    the round-1 kernels (default SC2=4,TR=1,CTX2=4 = claude/stack4's best combo; ATTNK_BASE overrides, "stock" = all 0):
+//   BASE    the round-1 kernels (default SC2=4,TR=1,CTX2=4, the round-1 best combo; ATTNK_BASE overrides, "stock" = all 0):
 //           every arm's timing is against BASE, so a gain is on top of round 1. BASE itself is the first arm (against stock).
 //   CHAIN   per-kernel table of BASE (what bit 1) and of stock (bit 4): in-chain cost of every node = T(prefix k) -
 //           T(prefix k-1), hot / cold / dead, DRAM floor.
