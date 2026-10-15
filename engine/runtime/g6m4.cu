@@ -504,6 +504,22 @@ int main(int argc, char** argv)
     const float dfl_alpha = getenv("G6_DFL_SEL_ALPHA") ? (float)atof(getenv("G6_DFL_SEL_ALPHA")) : 1.f;
     if (!std::isfinite(dfl_alpha)) die("G6_DFL_SEL_ALPHA: not a finite number");
     if (dfl_alpha != 1.f && !dfl) die("G6_DFL_SEL_ALPHA needs --dflash-manifest");
+    // G6_DFL_REUSE=1|2 (s2_batch.h DflReuse; default 0): 1 = a DFlash2 session whose prefill a prefix-reuse hit cut into
+    // the drafter's window keeps the drafter (the rows the prefill taps, and the ring's rows of the last DFlash2 session
+    // with the same tokens); 2 = also a session alone on MTP takes it. G6_DFL_REUSE_MIN=<rows> (0..2048, default 256): MTP
+    // rounds until the drafter holds that many context rows. Drafts only. In the S2 runtime signature
+    std::string dre;
+    const int dfl_reuse = env_choice("G6_DFL_REUSE", 2, 0, &dre);
+    if (dfl_reuse < 0) die(dre);
+    if (dfl_reuse && !(dfl && s2mode)) die("G6_DFL_REUSE needs --dflash-manifest and --serve");
+    int dfl_reuse_min = 256;
+    if (const char* e = getenv("G6_DFL_REUSE_MIN"))
+    {
+        char* end = nullptr;
+        const long v = strtol(e, &end, 10);
+        if (!*e || *end || v < 0 || v > dfl::WIN) die("G6_DFL_REUSE_MIN: 0.." + std::to_string(dfl::WIN) + " rows");
+        dfl_reuse_min = (int)v;
+    }
     g6::Fabric fabg, fabdg;
     bool fabg_on = false, fabdg_on = false;
     auto qs_fabric = [&](g6::Fabric& fb, const Model& mm, int port_off, const char* what) {
@@ -1036,11 +1052,15 @@ int main(int argc, char** argv)
         m.s2on = D.d.s2on = true;        // no session: the adapter starts in S2 mode (solo -1)
         G6RT_CK(cudaStreamSynchronize(st));
         // DFlash2: Dfl::pf_feat holds one request's prefill taps, the last WIN prompt positions of the session whose
-        // prefill started last (dfl_owner; -1 = none, or a prefix-reuse hit that skipped part of the window)
+        // prefill started last (dfl_owner; -1 = none, or a prefix-reuse hit that skipped part of the window, unless
+        // G6_DFL_REUSE: then the rows from dfl_from)
         static_assert(s2::DFL_B == dfl::B, "s2_batch.h DFL_B follows dfl::B");
+        static_assert(s2::DFL_WIN == dfl::WIN && s2::DFL_RING == dfl::RING, "s2_batch.h DFL_WIN / DFL_RING follow dfl::WIN / RING");
         int dfl_owner = -1;
+        int dfl_from = 0;                // the first window position the owner's prefill taps (G6_DFL_REUSE: past a hit's rows)
         uint64_t dfl_req = UINT64_MAX;
         std::array<uint32_t, g6s2::MAX_SESSIONS> slot_prompt{};
+        std::array<bool, g6s2::MAX_SESSIONS> slot_whole{};   // G6_DFL_REUSE: a hit holds every prompt row but the last (no prefill)
         u64 s2_dstep = 0;                // the drafter fabric's steps
         g6s2::NativeContext nx{m, D, P, P2, DQ, fab, fabd, fabp, fabp2, st, pf_streams ? &lanes2 : nullptr, in, in_d, out, out_d, MP, gsplit, two,
             [&](const StepIn& si) {
@@ -1089,7 +1109,8 @@ int main(int argc, char** argv)
                     dfl_req = sl.req.id;
                     DF.pf_hi = (int)sl.req.prompt_tokens - 1; DF.pf_lo = std::max(0, DF.pf_hi - dfl::WIN);
                     if (DF.pf_hi > DF.pf_lo) G6RT_CK(cudaMemsetAsync(DF.pf_feat, 0, (size_t)(DF.pf_hi - DF.pf_lo) * dfl::NT * HID * 2, st));
-                    dfl_owner = (int)sl.prefilled <= DF.pf_lo ? (int)sl.key.slot : -1;
+                    dfl_owner = (int)sl.prefilled <= DF.pf_lo || dfl_reuse ? (int)sl.key.slot : -1;
+                    dfl_from = std::max(DF.pf_lo, (int)sl.prefilled);
                 }
             },
             [&]() { m.s2_pf_table = D.d.s2_pf_table = false; },
@@ -1142,6 +1163,7 @@ int main(int argc, char** argv)
                 }
                 const int q = (int)g.key.slot;
                 slot_prompt[q] = g.req.prompt_tokens;
+                slot_whole[q] = dfl_reuse && g.reuse + 1 == g.req.prompt_tokens;
                 if (dfl_owner == q) dfl_owner = -1;     // the slot's previous session owned the taps
                 const bool ex = pool.exclusive_run(g.run);
                 // a prefix-reuse hit keeps the run's pages: rows below g.reuse are the retained session's, and every row
@@ -1226,13 +1248,18 @@ int main(int argc, char** argv)
                             kstop.mode == 1 ? ("tau " + std::to_string(kstop.tau[1]) + "," + std::to_string(kstop.tau[2]) + "," +
                                                std::to_string(kstop.tau[3])).c_str()
                                             : ("MTP estimates, seed3 " + std::to_string(kstop.seed3)).c_str(),
-                            h.dsel.on ? "" : "; the drafter choice is off, so no MTP rounds");
+                            h.dsel.on ? "" : dfl_reuse ? "; the drafter choice is off: G6_DFL_REUSE warm-up rounds only" : "; the drafter choice is off, so no MTP rounds");
+                h.dfl_reuse.mode = dfl_reuse;
+                h.dfl_reuse.min = dfl_reuse_min;
+                if (R == 0 && dfl_reuse) fprintf(stderr, "# s2 dflash reuse %d: reuse hits keep the drafter%s, warm-up %d context rows\n", dfl_reuse,
+                                                 dfl_reuse > 1 ? ", a session alone on MTP takes it" : "", dfl_reuse_min);
                 // a 1-token prompt has no prefill: the drafter starts from its prompt step (dfl_lo = first, as plain)
-                h.dispatch.dfl_ok = [&](int q) { return dfl_owner == q || slot_prompt[q] == 1; };
+                // G6_DFL_REUSE: also a hit into the window (the fill starts past its rows) and a hit with no prefill at all
+                h.dispatch.dfl_ok = [&](int q) { return dfl_owner == q || slot_prompt[q] == 1 || slot_whole[q]; };
                 h.dispatch.dfl_start = [&](int q) {    // the offline loop's fill steps: Dfl::pf_feat -> the ring
                     if (dfl_owner != q || DF.pf_hi <= DF.pf_lo) return (int)slot_prompt[q] - 1;
                     const auto t0 = std::chrono::steady_clock::now();
-                    for (int c0 = DF.pf_lo; c0 < DF.pf_hi; c0 += dfl::B)
+                    for (int c0 = dfl_from; c0 < DF.pf_hi; c0 += dfl::B)
                     {
                         DflIn di;
                         memset(&di, 0, sizeof di);
@@ -1244,9 +1271,9 @@ int main(int argc, char** argv)
                         G6RT_CK(cudaStreamSynchronize(st));
                         g6s2::require(!*fabf.dev().error, "S2 DFlash2 fabric error (prompt context)");
                     }
-                    if (R == 0) fprintf(stderr, "# s2 dflash slot %d prompt context %d..%d: %.1f ms\n", q, DF.pf_lo, DF.pf_hi - 1,
+                    if (R == 0) fprintf(stderr, "# s2 dflash slot %d prompt context %d..%d: %.1f ms\n", q, dfl_from, DF.pf_hi - 1,
                                         std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count());
-                    return DF.pf_lo;
+                    return dfl_from;
                 };
                 h.dispatch.dfl = [&](const s2::DflReq& r, const g6s2::Sampling& smp) {
                     DflIn di;
@@ -1283,7 +1310,8 @@ int main(int argc, char** argv)
                 (dfl_i4 ? " dflheadi4 " + std::to_string(dhead.tpc) + "x" + std::to_string(dhead.ks) : "") +
                 (dsel_start_mtp ? " dselstart mtp" : "") + (dsel_posclk ? " dselposclk 1" : "") + (dfl_alpha != 1.f ? " dflalpha " + std::to_string(dfl_alpha) : "") +
                 (kstop.mode ? " kstop " + std::to_string(kstop.mode) + " kmax " + std::to_string(kstop.kmax) + " tau " + std::to_string(kstop.tau[1]) + "," +
-                              std::to_string(kstop.tau[2]) + "," + std::to_string(kstop.tau[3]) + " seed3 " + std::to_string(kstop.seed3) : "");
+                              std::to_string(kstop.tau[2]) + "," + std::to_string(kstop.tau[3]) + " seed3 " + std::to_string(kstop.seed3) : "") +
+                (dfl_reuse ? " dflreuse " + std::to_string(dfl_reuse) + "/" + std::to_string(dfl_reuse_min) : "");
             fprintf(stderr, "# rank %d: s2 below R %d rows, pool %u logical / %d physical pages, %d sessions, epoch %llu, control %s:%d\n", R,
                     s2_below, sc.pool_rows / 64, place, s2sess, s2epoch, bc.head_ip.c_str(), s2port);
             g6s2::ControlLinks links = g6s2::bootstrap(bc);
