@@ -1156,7 +1156,21 @@ inline void launch_attn_block(Model& m, int i, int M, int context, cudaStream_t 
     dmark(DP_OPROJ, st);
 }
 
-inline void launch_consume(Model& m, int c, int M, const __nv_bfloat16* w, __half* out, cudaStream_t st)
+// G6_AR_WAITFOLD=1|2 (read once; unset / 0 = off): the target step's consumes wait for the peers' partials inside
+// glue::k_ar_wait_add_norm instead of a k_wait_peers launch before k_ar_add_norm, one launch less per consume (2 per
+// layer), same bytes. 1: one polling CTA per row cluster, then a cluster barrier; 2: every CTA polls. The MTP draft
+// step's consumes keep the separate wait: under G6_DRAFT_PAR they run next to the drafter step, and a folded grid
+// (8 M CTAs) would spin there past g6m4.cu's progress rule (at most 8 CTAs per waiting kernel)
+inline int ar_waitfold()
+{
+    static const int v = [] {
+        const int x = getenv("G6_AR_WAITFOLD") ? atoi(getenv("G6_AR_WAITFOLD")) : 0;
+        if (x < 0 || x > 2) die("G6_AR_WAITFOLD must be 0, 1 or 2");
+        return x;
+    }();
+    return v;
+}
+inline void launch_consume(Model& m, int c, int M, const __nv_bfloat16* w, __half* out, cudaStream_t st, int fold = 0)
 {
     glue::ArNormArgs a{m.f, m.stepp, c, M, m.resid, w, out, glue::RMS_EPS};
 #ifdef DEC_SLOT
@@ -1174,6 +1188,13 @@ inline void launch_consume(Model& m, int c, int M, const __nv_bfloat16* w, __hal
     {
         if (c % 2 == 0) bind::warm_mlp(layer_for(m, c / 2, M), st);
         else if (c / 2 + 1 < m.nl) bind::warm_proj(layer_for(m, c / 2 + 1, M), st, warm >= 2);
+    }
+    if (fold)   // G6_AR_WAITFOLD: the wait is in the norm kernel (the profiler's wait stage counts as norm)
+    {
+        if (fold == 1) glue::k_ar_wait_add_norm<1><<<dim3(glue::RN_CL, M), glue::RN_T, 0, st>>>(a);
+        else glue::k_ar_wait_add_norm<2><<<dim3(glue::RN_CL, M), glue::RN_T, 0, st>>>(a);
+        dmark(c % 2 == 0 ? DP_NORM_A : DP_NORM_M, st);
+        return;
     }
     glue::k_wait_peers<<<1, 32, 0, st>>>(m.f, m.stepp, c, (size_t)M * HID * 2, glue::ERR_AR);
     dmark(c % 2 == 0 ? DP_WAIT_A : DP_WAIT_M, st);
@@ -1447,9 +1468,9 @@ inline void launch_step(Model& m, int M, int context, cudaStream_t st, int part 
     for (int i = l0; i < l1; ++i)
     {
         launch_attn_block(m, i, M, context, st);
-        launch_consume(m, 2 * i, M, m.layers[i].mlp_norm, m.x2, st);
+        launch_consume(m, 2 * i, M, m.layers[i].mlp_norm, m.x2, st, ar_waitfold());
         launch_mlp_block(m, i, M, st);
-        launch_consume(m, 2 * i + 1, M, norm_after(m, i), m.x, st);
+        launch_consume(m, 2 * i + 1, M, norm_after(m, i), m.x, st, ar_waitfold());
         if (m.dfl_tap) m.dfl_tap(m, i, M, st);
     }
     if (part != 0)

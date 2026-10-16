@@ -809,12 +809,12 @@ int main(int argc, char** argv)
         {
             attn_all(i, M, context);
             deliver(2 * i, part);
-            for (Model& m : R) launch_consume(m, 2 * i, M, m.layers[i].mlp_norm, m.x2, st);
+            for (Model& m : R) launch_consume(m, 2 * i, M, m.layers[i].mlp_norm, m.x2, st, ar_waitfold());
             if (perturb != 0.f && i == 0) for (Model& m : R) k_perturb<<<M, 256, 0, st>>>(m.resid, m.pos, perturb);
             rd_copy(2 * i + 1, M);
             for (Model& m : R) launch_mlp_block(m, i, M, st);
             deliver(2 * i + 1, part);
-            for (Model& m : R) launch_consume(m, 2 * i + 1, M, norm_after(m, i), m.x, st);
+            for (Model& m : R) launch_consume(m, 2 * i + 1, M, norm_after(m, i), m.x, st, ar_waitfold());
             rd_copy(2 * i + 2, M);
         }
         if (pc == 0) return;
