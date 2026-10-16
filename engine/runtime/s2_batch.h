@@ -719,12 +719,14 @@ private:
         for (int j = 1; j <= n; ++j) if (kprob(x, j) < ks_.tau[j]) return false;
         return kprob(x, n) >= ks_.tau[n + 1];
     }
-    // KStop: the drafts of x.d[1..x.k] to verify (at least one)
+    // KStop: the drafts of x.d[1..x.k] to verify (at least one, at most kmax: a session G6_DFL_REUSE promoted holds the
+    // shared chain's K drafts, which can be more than kmax, and tau has kmax + 1 entries)
     int kverify(const St& x, double* pe) const
     {
-        if (ks_.mode == 2) return sel_.m.choose(x.dlm.data(), x.k, x.k, pe);
+        const int n = std::min(x.k, kmax());
+        if (ks_.mode == 2) return sel_.m.choose(x.dlm.data(), n, n, pe);
         int k = 0;
-        while (k < x.k && kprob(x, k + 1) >= ks_.tau[k + 1]) ++k;
+        while (k < n && kprob(x, k + 1) >= ks_.tau[k + 1]) ++k;
         return std::max(k, 1);
     }
     float dlp(int row) const { return h_.lp && (ks_.mode || ks_.log) ? h_.lp(row) : NAN; }
