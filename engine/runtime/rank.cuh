@@ -1690,8 +1690,10 @@ inline void launch_draft_keep(Draft& D, int M, cudaStream_t st)
 #endif
     k_mtp_keep<<<1, 256, 0, st>>>(D.d.x + (size_t)(M - 1) * HID, D.hprev);
 }
-// the whole draft step of one rank in stream order (real fabric)
-inline void launch_draft_step(Draft& D, int M, int context, bool chain, cudaStream_t st)
+// the whole draft step of one rank in stream order (real fabric). head = false (G6_MTP_HEAD_SKIP, a first form): no lm
+// head, local top list or merge, so no head collective (the step enqueues collectives 0 and 1 only); the layer's cache
+// rows, x and hprev are as with the head, StepOut's tokens and log-probabilities stay the last head's
+inline void launch_draft_step(Draft& D, int M, int context, bool chain, cudaStream_t st, bool head = true)
 {
     Model& d = D.d;
 #ifdef DEC_S2
@@ -1705,8 +1707,11 @@ inline void launch_draft_step(Draft& D, int M, int context, bool chain, cudaStre
     launch_consume(d, 0, M, d.layers[0].mlp_norm, d.x2, st);
     launch_mlp_block(d, 0, M, st);
     launch_consume(d, 1, M, d.final_norm, d.x, st);
-    launch_head_local(d, M, st);
-    launch_head_merge(d, M, st);
+    if (head)
+    {
+        launch_head_local(d, M, st);
+        launch_head_merge(d, M, st);
+    }
     launch_step_out(d, M, st);
     launch_draft_keep(D, M, st);
 }
