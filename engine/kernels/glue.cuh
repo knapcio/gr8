@@ -298,8 +298,15 @@ __device__ __forceinline__ void frag_store(const uint4& o, int col0, int m, int 
 }
 #endif
 
-// grid (RN_CL, M), block RN_T. Slot payload = M x 6144 BF16 row-major. Launch k_wait_peers(c, M*6144*2) first.
-__global__ void __cluster_dims__(RN_CL, 1, 1) __launch_bounds__(RN_T) k_ar_add_norm(ArNormArgs a)
+// k_ar_add_norm (W = 0, after a k_wait_peers launch) and k_ar_wait_add_norm (W = 1, 2: the wait folded in). Same
+// loads, same adds in the same order, same stores: W only adds the wait in front of the payload reads.
+// W = 1: CTA 0 of each row's cluster polls the tails (wait_peers: acquire.sys by threads 0..nr-1, then __syncthreads),
+// then the cluster barrier (barrier.cluster.arrive is release, .wait acquire by default) carries that acquire to the
+// cluster's other CTAs before any of them reads the payload with __ldcv (L1 not consulted). W = 2: every CTA polls, as
+// k_qs_get does (acquire, __syncthreads, __ldcv). Either way each payload read is ordered after an acquire that saw
+// every peer's tail, as the kernel boundary after k_wait_peers orders it today.
+template <int W>
+__device__ __forceinline__ void ar_add_norm(const ArNormArgs& a)
 {
     const u64 step = *a.stepp;
     const int m = blockIdx.y;
@@ -307,6 +314,20 @@ __global__ void __cluster_dims__(RN_CL, 1, 1) __launch_bounds__(RN_T) k_ar_add_n
     const size_t off = ((size_t)m * HID + col0) * 2;
     float x[8] = {0.f, 0.f, 0.f, 0.f, 0.f, 0.f, 0.f, 0.f};
     float4* r = reinterpret_cast<float4*>(a.resid + (size_t)m * HID + col0);
+    float4 r0, r1;
+    if (W)
+    {   // the residual is this stream's (no peer writes it): its read goes out under the wait
+        r0 = r[0]; r1 = r[1];
+        const u64 seq = g6::coll_seq(step, a.c, a.f.ncoll);
+        const size_t payload = (size_t)a.M * HID * 2;
+        if (W == 2) wait_peers(a.f, step, a.c, seq, payload, ERR_AR);
+        else
+        {
+            cg::cluster_group cl = cg::this_cluster();
+            if (cl.block_rank() == 0) wait_peers(a.f, step, a.c, seq, payload, ERR_AR);
+            cl.sync();
+        }
+    }
     if (a.f.nr == g6nr::NR)
     {   // every peer load in flight before the adds (one pinned-memory latency instead of NR); adds in rank order
         uint4 v[g6nr::NR];
@@ -330,7 +351,7 @@ __global__ void __cluster_dims__(RN_CL, 1, 1) __launch_bounds__(RN_T) k_ar_add_n
             #pragma unroll
             for (int k = 0; k < 8; ++k) x[k] += b[k];
         }
-    const float4 r0 = r[0], r1 = r[1];
+    if (!W) { r0 = r[0]; r1 = r[1]; }
     x[0] += r0.x; x[1] += r0.y; x[2] += r0.z; x[3] += r0.w;
     x[4] += r1.x; x[5] += r1.y; x[6] += r1.z; x[7] += r1.w;
     r[0] = make_float4(x[0], x[1], x[2], x[3]);
@@ -345,6 +366,11 @@ __global__ void __cluster_dims__(RN_CL, 1, 1) __launch_bounds__(RN_T) k_ar_add_n
     if (a.f.xt && threadIdx.x == 0)
         atomicMax(reinterpret_cast<unsigned long long*>(xt_rec(a.f, step, a.c) + g6::XT_RED), (unsigned long long)xt_now());
 }
+// grid (RN_CL, M), block RN_T. Slot payload = M x 6144 BF16 row-major. Launch k_wait_peers(c, M*6144*2) first.
+__global__ void __cluster_dims__(RN_CL, 1, 1) __launch_bounds__(RN_T) k_ar_add_norm(ArNormArgs a) { ar_add_norm<0>(a); }
+// G6_AR_WAITFOLD=1|2 (rank.cuh launch_consume): k_wait_peers + k_ar_add_norm as one kernel, same grid
+template <int W>
+__global__ void __cluster_dims__(RN_CL, 1, 1) __launch_bounds__(RN_T) k_ar_wait_add_norm(ArNormArgs a) { ar_add_norm<W>(a); }
 
 // ---------------------------------------------------------------- small-width RMSNorm (q_a 2048, kv latent 512)
 

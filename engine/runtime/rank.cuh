@@ -1172,7 +1172,21 @@ inline void launch_attn_block(Model& m, int i, int M, int context, cudaStream_t 
     dmark(DP_OPROJ, st);
 }
 
-inline void launch_consume(Model& m, int c, int M, const __nv_bfloat16* w, __half* out, cudaStream_t st)
+// G6_AR_WAITFOLD=1|2 (read once; unset / 0 = off): the target step's consumes wait for the peers' partials inside
+// glue::k_ar_wait_add_norm instead of a k_wait_peers launch before k_ar_add_norm, one launch less per consume (2 per
+// layer), same bytes. 1: one polling CTA per row cluster, then a cluster barrier; 2: every CTA polls. The MTP draft
+// step's consumes keep the separate wait: under G6_DRAFT_PAR they run next to the drafter step, and a folded grid
+// (8 M CTAs) would spin there past g6m4.cu's progress rule (at most 8 CTAs per waiting kernel)
+inline int ar_waitfold()
+{
+    static const int v = [] {
+        const int x = getenv("G6_AR_WAITFOLD") ? atoi(getenv("G6_AR_WAITFOLD")) : 0;
+        if (x < 0 || x > 2) die("G6_AR_WAITFOLD must be 0, 1 or 2");
+        return x;
+    }();
+    return v;
+}
+inline void launch_consume(Model& m, int c, int M, const __nv_bfloat16* w, __half* out, cudaStream_t st, int fold = 0)
 {
     glue::ArNormArgs a{m.f, m.stepp, c, M, m.resid, w, out, glue::RMS_EPS};
 #ifdef DEC_SLOT
@@ -1194,6 +1208,13 @@ inline void launch_consume(Model& m, int c, int M, const __nv_bfloat16* w, __hal
     // G6_L2PF: this layer's router and shared expert (2i), the next layer's front (2i+1) while this rank waits
     if (c % 2 == 0) l2pf_window(m, l2pf::W_A, l2pf::T_ROUTER, c / 2, M, &m.f, c, (size_t)M * HID * 2, st);
     else if (c / 2 + 1 < m.nl) l2pf_window(m, l2pf::W_M, l2pf::T_XIN, c / 2 + 1, M, &m.f, c, (size_t)M * HID * 2, st);
+    if (fold)   // G6_AR_WAITFOLD: the wait is in the norm kernel (the profiler's wait stage counts as norm)
+    {
+        if (fold == 1) glue::k_ar_wait_add_norm<1><<<dim3(glue::RN_CL, M), glue::RN_T, 0, st>>>(a);
+        else glue::k_ar_wait_add_norm<2><<<dim3(glue::RN_CL, M), glue::RN_T, 0, st>>>(a);
+        dmark(c % 2 == 0 ? DP_NORM_A : DP_NORM_M, st);
+        return;
+    }
     glue::k_wait_peers<<<1, 32, 0, st>>>(m.f, m.stepp, c, (size_t)M * HID * 2, glue::ERR_AR);
     dmark(c % 2 == 0 ? DP_WAIT_A : DP_WAIT_M, st);
     glue::k_ar_add_norm<<<dim3(glue::RN_CL, M), glue::RN_T, 0, st>>>(a);
@@ -1467,9 +1488,9 @@ inline void launch_step(Model& m, int M, int context, cudaStream_t st, int part 
     for (int i = l0; i < l1; ++i)
     {
         launch_attn_block(m, i, M, context, st);
-        launch_consume(m, 2 * i, M, m.layers[i].mlp_norm, m.x2, st);
+        launch_consume(m, 2 * i, M, m.layers[i].mlp_norm, m.x2, st, ar_waitfold());
         launch_mlp_block(m, i, M, st);
-        launch_consume(m, 2 * i + 1, M, norm_after(m, i), m.x, st);
+        launch_consume(m, 2 * i + 1, M, norm_after(m, i), m.x, st, ar_waitfold());
         if (m.dfl_tap) m.dfl_tap(m, i, M, st);
     }
     if (part != 0)
@@ -1690,8 +1711,10 @@ inline void launch_draft_keep(Draft& D, int M, cudaStream_t st)
 #endif
     k_mtp_keep<<<1, 256, 0, st>>>(D.d.x + (size_t)(M - 1) * HID, D.hprev);
 }
-// the whole draft step of one rank in stream order (real fabric)
-inline void launch_draft_step(Draft& D, int M, int context, bool chain, cudaStream_t st)
+// the whole draft step of one rank in stream order (real fabric). head = false (G6_MTP_HEAD_SKIP, a first form): no lm
+// head, local top list or merge, so no head collective (the step enqueues collectives 0 and 1 only); the layer's cache
+// rows, x and hprev are as with the head, StepOut's tokens and log-probabilities stay the last head's
+inline void launch_draft_step(Draft& D, int M, int context, bool chain, cudaStream_t st, bool head = true)
 {
     Model& d = D.d;
 #ifdef DEC_S2
@@ -1705,8 +1728,11 @@ inline void launch_draft_step(Draft& D, int M, int context, bool chain, cudaStre
     launch_consume(d, 0, M, d.layers[0].mlp_norm, d.x2, st);
     launch_mlp_block(d, 0, M, st);
     launch_consume(d, 1, M, d.final_norm, d.x, st);
-    launch_head_local(d, M, st);
-    launch_head_merge(d, M, st);
+    if (head)
+    {
+        launch_head_local(d, M, st);
+        launch_head_merge(d, M, st);
+    }
     launch_step_out(d, M, st);
     launch_draft_keep(D, M, st);
 }

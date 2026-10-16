@@ -350,6 +350,9 @@ public:
             if (stats.switches || stats.mtp_rounds)
                 fprintf(stderr,"# s2 drafter choice slot %u: %ld of %ld rounds on MTP, %ld switches, %ld tokens\n",unsigned(k.slot),
                         stats.mtp_rounds,stats.rounds,stats.switches,stats.tokens);
+            if (stats.head_skips && !c_.rank)   // G6_MTP_HEAD_SKIP
+                fprintf(stderr,"# s2 MTP head skip slot %u: %ld of %ld rounds' first forms without the head\n",unsigned(k.slot),
+                        stats.head_skips,stats.rounds);
             if (native_.dfl_reuse.mode && !c_.rank)   // every request, so one that never had the drafter shows too
                 fprintf(stderr,"# s2 dflash reuse slot %u: %ld of %ld rounds on DFlash2, %ld on MTP; context from %d (taps from %d), "
                         "warm-up to %d, promoted at %d, %ld tokens\n",unsigned(k.slot),stats.dfl_rounds,stats.rounds,stats.mtp_rounds,

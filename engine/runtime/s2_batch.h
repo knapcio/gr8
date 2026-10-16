@@ -27,7 +27,8 @@
 // needs no catch-up; every DSel::probe-th of them also drafts, and its 7 drafts are scored against the tokens later
 // rounds commit. On DFlash2 rounds the MTP first-form pass already drafts d[1], which scores MTP's first position. The
 // estimates start afresh with each request. G6_S2_DSEL_MODEL: the costs come from one frozen table (DSelTable), and MTP
-// rounds are priced as the confidence stop runs them.
+// rounds are priced as the confidence stop runs them. G6_MTP_HEAD_SKIP: on DFlash2 rounds whose next round stays on
+// DFlash2 the first-form pass may run without its head (Step::nohead), so that d[1] is not drafted (St::d1ok).
 // Confidence stop (Batch::kstop, G6_MTP_KSTOP): a solo DFlash2 session's MTP rounds draft and verify k <= KStop::kmax
 // MTP drafts, chosen from the drafts' log-probabilities under the MTP head (StepOut::lp, Hooks::lp): the chain stops
 // before a draft that could not be verified, and the verify takes the drafts that pass. The log-probabilities are the
@@ -83,6 +84,9 @@ struct Step
     // sessions were active in that round (a draft or chain step holds only the survivors)
     long round = -1;
     int round_active = 0;
+    // G6_MTP_HEAD_SKIP (DRAFT, solo only): the first form without its head: the MTP layer writes its cache and hprev,
+    // no token is drafted (run() returns no usable ids, Hooks::lp none)
+    bool nohead = false;
     std::vector<int> sess, row0, rows, ctx;
     std::vector<Row> r;
     int M() const { return (int)r.size(); }
@@ -91,7 +95,7 @@ struct Step
     std::string key() const
     {   // a main step's k1 class is part of its graph: a 4-row prompt tail (class 5) and a 2-session round of 2 rows (class 3)
         if (kind == MAIN) return "m" + std::to_string(M()) + "c" + std::to_string(cls);
-        return std::string(kind == DRAFT ? "d" : "c") + std::to_string(M());
+        return std::string(kind == DRAFT ? nohead ? "dh" : "d" : "c") + std::to_string(M());
     }
 };
 
@@ -111,6 +115,7 @@ struct Stats
     long inserted = 0;                // tokens the insert rule put in
     std::vector<long> acc;            // [K+1] rounds by accepted drafts (K = 7 for a DFlash2 session)
     long dfl_rounds = 0;              // rounds that verified DFlash2 drafts
+    long head_skips = 0;              // G6_MTP_HEAD_SKIP: first forms run without their head
     // G6_DFL_REUSE (Batch::dfl_reuse, -1 = not set): where dfl_start filled the drafter from, the lowest position it held
     // context for, the position the MTP warm-up ran to (0 = none), the position the session took the drafter at (promote)
     int dfl_from = -1, dfl_lo = -1, dfl_warm = 0, promoted = -1;
@@ -179,6 +184,13 @@ inline bool dsel_env() { const char* e = getenv("G6_S2_DSEL"); return !e || atoi
 // step before the MTP first form, on its own stream, and waits for it at the end of the round (after the chain on MTP).
 // Both are fixed graphs on separate weights, scratch and fabrics, so each one's output bytes are as serial; 0 = serial
 inline int draft_par_env() { const char* e = getenv("G6_DRAFT_PAR"); return e ? atoi(e) : 0; }
+// G6_MTP_HEAD_SKIP=P (every rank, read at boot; g6m4 captures the head-less first forms; 0 = off): a solo DFlash2 round
+// whose next round drafts with DFlash2 again (no switch to MTP, no probe, no G6_DFL_REUSE warm-up, no insert) runs the
+// MTP first form without its head on all but every P-th such round. The layer still writes MTP's cache and hprev; d[1] is
+// not drafted (St::d1ok). Its readers there: the drafter choice's MTP position-1 observation next round (score: skipped,
+// so it learns from every P-th such round) and demote (chains from DFlash2's own draft for that position, dd[1]). The
+// decision comes before the first form, from the drafter choice (made first, as under G6_DRAFT_PAR). Drafts only
+inline int head_skip_env() { const char* e = getenv("G6_MTP_HEAD_SKIP"); return e ? std::max(0, atoi(e)) : 0; }
 // G6_S2_DSEL_MODEL=1|2 with G6_S2_DSEL_TABLE (every rank, read at boot; DSel::model): the drafter choice prices both
 // drafters from one frozen cost table in place of the drafting constants (G6_S2_DSEL_DCOST / _MCOST / _MEACH) and
 // spec_len.h's verify table, and prices MTP rounds as the active confidence stop (KStop) runs them, not as K drafts.
@@ -429,8 +441,12 @@ public:
             {
                 st_[q].dfl = false;
                 // on MTP already: d[2..K] are drafted (KStop: d[2..k], the rest chained here). Inserted tokens waiting for
-                // their steps: forced() chains them
-                if (!st_[q].mtp && st_[q].force < 0) chain({q}, {int(Step::ROUND)}, K_);
+                // their steps: forced() chains them. G6_MTP_HEAD_SKIP: no d[1] drafted, DFlash2's draft of that position
+                if (!st_[q].mtp && st_[q].force < 0)
+                {
+                    if (!st_[q].d1ok) { st_[q].d[1] = st_[q].dd[1]; st_[q].dlm[1] = NAN; st_[q].d1ok = true; }
+                    chain({q}, {int(Step::ROUND)}, K_);
+                }
                 else if (st_[q].k < K_ && st_[q].force < 0) chain({q}, {int(Step::ROUND)}, K_, st_[q].k);
                 st_[q].mtp = false;
             }
@@ -520,6 +536,7 @@ private:
                 {   // dlm[1]: KStop's input once G6_DFL_REUSE=2 promotes the session to the solo path (NaN when both are off)
                     st_[d.sess[i]].d[1] = u[d.row0[i] + d.rows[i] - 1];
                     st_[d.sess[i]].dlm[1] = dlp(d.row0[i] + d.rows[i] - 1);
+                    st_[d.sess[i]].d1ok = true;
                 }
             }
         }
@@ -568,7 +585,8 @@ private:
             char b[48];
             for (int j = 1; j <= n; ++j) { snprintf(b, sizeof b, "%s%.6g", j > 1 ? "," : "", lp[j]); l += b; }
             fprintf(stderr, "# kstop round %ld slot %d n %ld %s base %d k %d nd %d a %d lp %s m1 %.6g m1ok %d pe %.3f hash %08x\n",
-                    cur_round_, q, stats_[q].rounds, m ? "mtp" : "dfl", base, k, n, a, l.c_str(), x.dlm[1], x.d[1] == t[0] ? 1 : 0, pe,
+                    cur_round_, q, stats_[q].rounds, m ? "mtp" : "dfl", base, k, n, a, l.c_str(), x.d1ok ? x.dlm[1] : NAN,
+                    x.d1ok ? (x.d[1] == t[0] ? 1 : 0) : -1, pe,
                     g6rt::SpecLen::hash(lp, n, k));
         }
         if (h_.round) h_.round(q, stats_[q].rounds, base, a, k);
@@ -578,25 +596,33 @@ private:
         else ++stats_[q].dfl_rounds;
         if (h_.emit && h_.emit(q, &x.tokens[base + 1], c, 0)) { x.done = true; return; }
         // G6_DRAFT_PAR: the drafter choice reads nothing the first form writes, so it is made first and the drafter step
-        // runs under the first form
-        const bool par = par_ && x.force < 0;
+        // runs under the first form. G6_MTP_HEAD_SKIP: made first too, it decides whether the first form drafts d[1]
+        const bool par = par_ && x.force < 0, early = (par_ || hskip_) && x.force < 0;
         bool nm = false, probe = false;
         DflReq r{};
-        if (par)
+        if (early)
         {
             r = choose_drafter(q, base, a, t[a], nm, probe);
-            r.phase = 1;
-            drafts(q, r);
+            if (par) { r.phase = 1; drafts(q, r); }
         }
+        // G6_MTP_HEAD_SKIP: the next round stays on DFlash2 (nm covers a switch, a probe and the warm-up), where d[1] is
+        // only MTP's position-1 observation: every hskip_-th such round keeps the head
+        const bool head = !(hskip_ && x.force < 0 && !nm && ++x.hn % hskip_ != 0);
         Step d;
         d.kind = Step::DRAFT; d.event = v.event;
         d.round = cur_round_; d.round_active = cur_active_;
+        d.nohead = !head;
         const int dn = std::min(kept, a) + 1;   // rows whose input the session committed
         add_rows(d, q, draft_rows(q, dn, base, &x.tokens[base + 1]), v.event);
         d.cls = row_class(d.M());
         check(d);
-        x.d[1] = h_.run(d)[dn - 1];
-        x.dlm[1] = dlp(dn - 1);
+        if (head)
+        {
+            x.d[1] = h_.run(d)[dn - 1];
+            x.dlm[1] = dlp(dn - 1);
+        }
+        else { h_.run(d); ++stats_[q].head_skips; }
+        x.d1ok = head;
         if (x.force >= 0)                 // the insert cut this round: the drafter takes the rows as context, forced() drafts
         {
             drafts(q, DflReq{q, dn, base, 0, x.lo, false});
@@ -605,7 +631,7 @@ private:
         }
         if (!par)
         {
-            r = choose_drafter(q, base, a, t[a], nm, probe);
+            if (!early) r = choose_drafter(q, base, a, t[a], nm, probe);
             drafts(q, r);
         }
         else
@@ -666,6 +692,8 @@ private:
         int force = -1;                   // inserted tokens from this position on wait for their steps (forced); -1: none
         int dd[DFL_B] = {};               // DFlash2 drafts d1..d7 and their log-probabilities under the drafter
         float dl[DFL_B] = {};
+        bool d1ok = true;                 // G6_MTP_HEAD_SKIP: d[1] / dlm[1] hold the last first form's draft (false: not drafted)
+        int hn = 0;                       // G6_MTP_HEAD_SKIP: the session's rounds that could skip the head
     };
     // the chain of a solo session about to verify MTP drafts: K-1 steps, or with KStop while kmore() allows (x.k drafted)
     void kchain(int q, int ev)
@@ -746,7 +774,7 @@ private:
         if (!x.mtp)
         {
             sel_.d.observe(k, a, x.dl, 0);
-            sel_.m.observe(1, x.d[1] == t[0] ? 1 : 0, ml, 0);
+            if (x.d1ok) sel_.m.observe(1, x.d[1] == t[0] ? 1 : 0, ml, 0);   // G6_MTP_HEAD_SKIP: d[1] not drafted, nothing to score
             dfl_obs(a + 1, k);
             return;
         }
@@ -853,6 +881,7 @@ private:
     bool adapt_ = false;
     int dkv_ = DFL_B - 1;
     bool par_ = draft_par_env() != 0;
+    int hskip_ = head_skip_env();
     g6rt::SpecLen dsl_;
     DSel sel_;
     KStop ks_;
@@ -1029,6 +1058,7 @@ private:
             check(d);
             x.d[1] = h_.run(d)[M - 1];
             x.dlm[1] = dlp(M - 1);
+            x.d1ok = true;
             if (x.dfl) drafts(q, DflReq{q, M, p0, last ? t[M - 1] : 0, x.lo, last});
         }
         if (!x.dfl) chain({q}, {ev}, K_);

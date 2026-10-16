@@ -557,6 +557,19 @@ int main(int argc, char** argv)
     const int draft_par = env_choice("G6_DRAFT_PAR", 2, 0, &dpe);
     if (draft_par < 0) die(dpe);
     if (draft_par && !(dfl && s2mode && mtp)) die("G6_DRAFT_PAR needs --dflash-manifest, --mtp and --serve");
+    // G6_MTP_HEAD_SKIP=P (s2_batch.h head_skip_env; default 0): a solo DFlash2 round that stays on DFlash2 runs the MTP
+    // first form without its head (lm head GEMV, local top list, merge, head collective) on all but every P-th such
+    // round; head-less first-form graphs are captured for the rows such a round can have. Drafts only. In the S2
+    // runtime signature (a rank that ran the head would wait for a head collective the others never send)
+    int head_skip = 0;
+    if (const char* e = getenv("G6_MTP_HEAD_SKIP"))
+    {
+        char* end = nullptr;
+        const long v = strtol(e, &end, 10);
+        if (!*e || *end || v < 0 || v > 1000000) die("G6_MTP_HEAD_SKIP: 0 (off) or P >= 1 (every P-th such round keeps the head)");
+        head_skip = (int)v;
+    }
+    if (head_skip && !(dfl && s2mode && mtp)) die("G6_MTP_HEAD_SKIP needs --dflash-manifest, --mtp and --serve");
     g6::Fabric fabg, fabdg;
     bool fabg_on = false, fabdg_on = false;
     auto qs_fabric = [&](g6::Fabric& fb, const Model& mm, int port_off, const char* what) {
@@ -839,6 +852,7 @@ int main(int argc, char** argv)
     for (int M : draft_rows) prepare(D.d, M, st);
     G6RT_CK(cudaStreamSynchronize(st));
     cudaGraphExec_t exec[NBK][MX + 1] = {}, exec_d[NBK][2][MX + 1] = {};      // [context bucket][...]
+    cudaGraphExec_t exec_dh[NBK][MX + 1] = {};      // G6_MTP_HEAD_SKIP: head-less first forms
     // DEC_GSPLIT: G6_DEC_SPLIT=ls (1..nl-1) captures the target step as two graphs, exec = step_in, embed, layers [0, ls) and
     // exec2 = the rest; launched back to back, the second graph's submission overlaps the first one's GPU time (0 = one graph)
     const int gsplit = getenv("G6_DEC_SPLIT") ? atoi(getenv("G6_DEC_SPLIT")) : 0;
@@ -879,6 +893,10 @@ int main(int argc, char** argv)
             D.d.cur = m.cur = k;
             for (int M : draft_rows) capture([&] { launch_draft_step(D, M, 0, false, st); }, &exec_d[k][0][M], "first draft ", M);
             if (mtp > 1) capture([&] { launch_draft_step(D, 1, 0, true, st); }, &exec_d[k][1][1], "chain draft ", 1);
+            // G6_MTP_HEAD_SKIP: a solo round's first form has a + 1 <= max(DFlash2's k, K, KStop's kmax) + 1 rows
+            for (int M : draft_rows)
+                if (head_skip && M <= std::max({dfl_k, mtp, kstop.kmax}) + 1)
+                    capture([&] { launch_draft_step(D, M, 0, false, st, false); }, &exec_dh[k][M], "head-less first draft ", M);
         }
     }
     FILE* dfl_dump = dfl && R == 0 && getenv("G6_DFL_DUMP") ? fopen(getenv("G6_DFL_DUMP"), "wb") : nullptr;   // dflash.cuh dfl_dump_step
@@ -1175,6 +1193,11 @@ int main(int argc, char** argv)
                 return c | p;
             },
             [&](unsigned long long step, int rows) { qsd_enqueue(step, rows); }};
+        if (head_skip)
+            nx.solo_draft_nohead = [&](int k, int M) {
+                g6s2::require(k >= 0 && k < D.d.nbk && M >= 1 && M <= MX && exec_dh[k][M], "S=1 head-less draft graph not captured");
+                G6RT_CK(cudaGraphLaunch(exec_dh[k][M], st));
+            };
         try
         {
             g6s2::NativeDispatch nd(nx, sc);
@@ -1316,6 +1339,8 @@ int main(int argc, char** argv)
                 h.dfl_reuse.min = dfl_reuse_min;
                 if (R == 0 && dfl_reuse) fprintf(stderr, "# s2 dflash reuse %d: reuse hits keep the drafter%s, warm-up %d context rows\n", dfl_reuse,
                                                  dfl_reuse > 1 ? ", a session alone on MTP takes it" : "", dfl_reuse_min);
+                if (R == 0 && head_skip) fprintf(stderr, "# s2 MTP head skip %d: DFlash2 rounds staying on DFlash2 run the first form "
+                                                 "without its head, every %d-th keeps it\n", head_skip, head_skip);
                 // a 1-token prompt has no prefill: the drafter starts from its prompt step (dfl_lo = first, as plain)
                 // G6_DFL_REUSE: also a hit into the window (the fill starts past its rows) and a hit with no prefill at all
                 h.dispatch.dfl_ok = [&](int q) { return dfl_owner == q || slot_prompt[q] == 1 || slot_whole[q]; };
@@ -1397,7 +1422,7 @@ int main(int argc, char** argv)
                 (kstop.mode ? " kstop " + std::to_string(kstop.mode) + " kmax " + std::to_string(kstop.kmax) + " tau " + std::to_string(kstop.tau[1]) + "," +
                               std::to_string(kstop.tau[2]) + "," + std::to_string(kstop.tau[3]) + " seed3 " + std::to_string(kstop.seed3) : "") +
                 (dfl_reuse ? " dflreuse " + std::to_string(dfl_reuse) + "/" + std::to_string(dfl_reuse_min) : "") +
-                (draft_par ? " draftpar " + std::to_string(draft_par) : "") +
+                (draft_par ? " draftpar " + std::to_string(draft_par) : "") + (head_skip ? " headskip " + std::to_string(head_skip) : "") +
                 (dsel_model ? " dselmodel " + std::to_string(dsel_model) + " " + dsel_tab.str() : "");
             fprintf(stderr, "# rank %d: s2 below R %d rows, pool %u logical / %d physical pages, %d sessions, epoch %llu, control %s:%d\n", R,
                     s2_below, sc.pool_rows / 64, place, s2sess, s2epoch, bc.head_ip.c_str(), s2port);

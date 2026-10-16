@@ -17,7 +17,8 @@ inline long long s2_wall_ms() {
     return std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::system_clock::now().time_since_epoch()).count();
 }
 // G6_S2_TIMELINE=N (every rank, N > 0): where the time between decode steps goes. Each step launch (main, first-form
-// draft, chain here; the DFlash2 drafter steps in g6m4) stamps the host clock on entry, before and after its graph launch
+// draft, chain here, draft_nh = G6_MTP_HEAD_SKIP's head-less first form; the DFlash2 drafter steps in g6m4) stamps the
+// host clock on entry, before and after its graph launch
 // and after its fence, and records a CUDA event before and after its graph(s). After the fence it adds the step to its
 // kind's totals (GPU span = event to event; host input prep, launch call, fence wait) and the transition from the step
 // before to that pair's totals (GPU idle = the previous step's end event to this step's start event; host = the previous
@@ -31,7 +32,7 @@ inline long long s2_wall_ms() {
 // transitions, which stay on the target stream: main>draft's host time holds the phase 1 launch, and the idle before
 // the next main step holds that tail.
 struct S2Timeline {
-    enum Kind { MAIN, DRAFT, CHAIN, DCTX, DQUERY, DCTX_PAR, DQUERY_PAR, NK };
+    enum Kind { MAIN, DRAFT, CHAIN, DCTX, DQUERY, DCTX_PAR, DQUERY_PAR, DRAFT_NH, NK };
     using clk = std::chrono::steady_clock;
     int every = 0;
     cudaEvent_t ev[2][2] = {};          // [pair][start, end]; pairs alternate, so the previous step's end stays readable
@@ -45,7 +46,7 @@ struct S2Timeline {
     static constexpr int MR = 16;       // per row count too, rows 1..MR (the drafter choice's cost table, s2_dsel_table.py)
     long nm[NK][MR + 1] = {};
     double sm[NK][MR + 1] = {};
-    static const char* name(int k) { static const char* s[NK] = {"main", "draft", "chain", "dfl_ctx", "dfl_query", "dfl_ctx_par", "dfl_query_par"}; return s[k]; }
+    static const char* name(int k) { static const char* s[NK] = {"main", "draft", "chain", "dfl_ctx", "dfl_query", "dfl_ctx_par", "dfl_query_par", "draft_nh"}; return s[k]; }
     static double ms(clk::time_point a, clk::time_point b) { return std::chrono::duration<double,std::milli>(b - a).count(); }
     S2Timeline() {
         const char* e = getenv("G6_S2_TIMELINE");
@@ -139,6 +140,8 @@ struct NativeContext {
     std::function<unsigned()> extra_error;
     // optional: a draft step's extra fabric work after its draft fabric enqueue (G6_MTP_SPLIT: the draft gathers)
     std::function<void(unsigned long long step, int rows)> enqueue_draft_extra;
+    // optional (G6_MTP_HEAD_SKIP): the S=1 first form without its head (s2::Step::nohead)
+    std::function<void(int bucket, int rows)> solo_draft_nohead;
 };
 class NativeDispatch {
     NativeContext c_;
@@ -147,7 +150,7 @@ class NativeDispatch {
     // G6_S2_ROUNDLOG=1 (rank 0; g6m4 allocates the main model's route copies): one "# s2_round" line per decode step
     const bool rlog_ = c_.main.rank == 0 && c_.main.rlog && ::getenv("G6_S2_ROUNDLOG") && *::getenv("G6_S2_ROUNDLOG") == '1';
     static const char* step_kind(const Launch& l) {
-        return l.step.kind == s2::Step::MAIN ? "main" : (l.step.kind == s2::Step::CHAIN ? "chain" : "draft");
+        return l.step.kind == s2::Step::MAIN ? "main" : (l.step.kind == s2::Step::CHAIN ? "chain" : l.step.nohead ? "draft_nh" : "draft");
     }
     // first-step timer: E1/E2 event label (design r3/r4).
     // first-step timer r3: the header is derived from the events of the
@@ -244,7 +247,9 @@ class NativeDispatch {
             step_kind(l),l.step.round,l.step.round_active,l.step.sess.size(),rows,ms,l.solo >= 0 ? "solo" : "reuse",ex.c_str());
     }
     std::vector<int> launch(const Launch& l) {
-        const bool draft = l.step.kind != s2::Step::MAIN, chain = l.step.kind == s2::Step::CHAIN;
+        const bool draft = l.step.kind != s2::Step::MAIN, chain = l.step.kind == s2::Step::CHAIN, nohead = l.step.nohead;
+        // G6_MTP_HEAD_SKIP: only the solo first form has a head-less graph
+        require(!nohead || (l.step.kind == s2::Step::DRAFT && l.solo >= 0 && c_.solo_draft_nohead), "head-less draft step outside the S=1 first form");
         auto& model = draft ? c_.draft.d : c_.main;
         auto& fabric = draft ? c_.draft_fabric : c_.main_fabric;
         const int rows = l.step.M();
@@ -263,22 +268,24 @@ class NativeDispatch {
         *(draft ? c_.draft_input : c_.input) = input;
         *(draft ? draft_layout_ : layout_) = layout;
         if (draft) {
-            std::vector<uint32_t> sizes(3,uint32_t(rows*::HID*2));
-            sizes[2] = uint32_t(glue::head_bytes(rows,model.nc)); c_.draft_fabric.enqueue_step(input.step,sizes);
+            std::vector<uint32_t> sizes(nohead ? 2 : 3,uint32_t(rows*::HID*2));   // nohead: no head collective (2)
+            if (!nohead) sizes[2] = uint32_t(glue::head_bytes(rows,model.nc));
+            c_.draft_fabric.enqueue_step(input.step,sizes);
             if (c_.enqueue_draft_extra) c_.enqueue_draft_extra(input.step,rows);
         } else c_.enqueue_main(input); // preserves existing RS order/fabric layout
         const auto tl0 = tmr_ || rlog_ ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{}; // after fabric enqueue, BEFORE the solo/S2 launch branches (design r4 fix 2)
         tl.pre(c_.stream);
         if (l.solo >= 0) {
-            if (draft) c_.solo_draft(l.buckets[0],chain,rows); else c_.solo_main(l.buckets[0],rows);
+            if (nohead) c_.solo_draft_nohead(l.buckets[0],rows);
+            else if (draft) c_.solo_draft(l.buckets[0],chain,rows); else c_.solo_main(l.buckets[0],rows);
         } else {
             const auto& g = graphs_.at(l.graph_key); G6RT_CK(cudaGraphLaunch(g.a,c_.stream));
             if (g.b) G6RT_CK(cudaGraphLaunch(g.b,c_.stream));
         }
         tl.post(c_.stream);
-        fence(); tl.done(draft ? (chain ? S2Timeline::CHAIN : S2Timeline::DRAFT) : S2Timeline::MAIN, rows, c_.main.rank);
+        fence(); tl.done(draft ? (chain ? S2Timeline::CHAIN : nohead ? S2Timeline::DRAFT_NH : S2Timeline::DRAFT) : S2Timeline::MAIN, rows, c_.main.rank);
         const auto out = *(draft ? c_.draft_output : c_.output);
-        if (draft) { std::copy(out.lp, out.lp + rows, dlp_); dlp_rows_ = rows; }
+        if (draft) { std::copy(out.lp, out.lp + rows, dlp_); dlp_rows_ = nohead ? 0 : rows; }   // nohead: out.tok / lp are an older step's
         if (!draft) {
             g6rt::evprof_read(rows,c_.stream,c_.main.rank);
             lp_rows_ = 0;
@@ -298,6 +305,7 @@ class NativeDispatch {
             fprintf(stderr,"# S2 step error words: fabric %u attn %u cp %u (%s step %llu rows %d solo %d ctx %d)\n",fe,ae,ce,
                 draft ? (chain ? "chain" : "draft") : "main",(unsigned long long)input.step,rows,l.solo,int(l.context));
         require(!fe && !ae && !ce, "S2 native step fabric/attention error");
+        if (nohead) return std::vector<int>(rows,-1);
         return {out.tok,out.tok + rows};
     }
     void prefill(const Slot& slot,const Payload& payload,uint32_t first,uint32_t rows) {
