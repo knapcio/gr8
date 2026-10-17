@@ -1,5 +1,124 @@
 # Changelog
 
+## 2026-10-16: a decode step timeline for S2 (G6_S2_TIMELINE, a measurement)
+
+- `G6_S2_TIMELINE=N` (every rank, off by default) splits the time between decode steps into GPU work and host round
+  trip. Around each decode step launch (main, first-form draft, chain, DFlash2 context-only and query steps) the host
+  stamps its clock and records a CUDA event before and after the graph launch; after the fence it adds the step's GPU
+  span, input prep, launch call and fence wait to per-kind totals, and the GPU idle since the previous step's end plus
+  the host time since the previous fence to per-transition totals. Every N main steps each rank prints them.
+- Prefill quanta, mode switches and the drafter's prompt fill cut the chain; gaps over 20 ms count as breaks. With
+  `G6_DRAFT_PAR` the drafter step on its own stream is timed apart (`dfl_ctx_par` / `dfl_query_par`).
+- It sizes the host round trip that a device-side accept and launch could remove. Unset, it records nothing.
+
+## 2026-10-16: the DFlash2 drafter step under MTP's first form, on its own stream (G6_DRAFT_PAR, off by default)
+
+- In a round of a request that decodes alone with DFlash2, the drafter step ran after MTP's first form (and after the
+  MTP chain on the drafter choice's MTP rounds). Neither reads what the other writes: they are fixed graphs on separate
+  weights, scratch and fabrics, and the drafter choice reads nothing the first form writes. `G6_DRAFT_PAR=1` makes the
+  choice first, launches the drafter step on its own stream, runs the first form (and the chain) on the main stream,
+  and waits for the drafter at the end of the round. 2 puts a drafting step on a high-priority stream.
+- Every kernel that waits for its peers runs at most 8 CTAs, so the other stream always finds SMs and neither can
+  starve the other's fabric wait.
+- The same graphs on the same inputs as serial: every step's bytes are unchanged. `batch_draftpar_test` (host) runs
+  serial and parallel batches through the drafter choice, the confidence stop, the insert rule and `G6_DFL_REUSE`, and
+  checks the same tokens, requests, steps and statistics. `G6_S2_ROUNDLOG` adds a `# s2_dfl` line: the drafter step's
+  launch-to-wait time.
+
+## 2026-10-16: an MTP confidence stop for a request's solo MTP rounds (G6_MTP_KSTOP, off by default)
+
+- A request that decodes alone and drafts with MTP (the drafter choice's MTP rounds, and with `G6_DFL_REUSE` its
+  warm-up and promoted rounds) chained and verified `--mtp` drafts every round. `G6_MTP_KSTOP=1` chains and verifies
+  1..`G6_MTP_KSTOP_KMAX` (at most 3) drafts instead, chosen from the MTP head's own log-probabilities, which S2 now
+  returns with the draft steps: draft j is verified while p_1 x .. x p_j >= `G6_MTP_KSTOP_TAU` t_j, and the chain stops
+  before a draft that could not pass. `G6_MTP_KSTOP=2` takes the count from the drafter choice's MTP estimates.
+- The log-probabilities are the same bytes on every rank, so every rank takes the same k; the policy is in the S2
+  runtime signature. A session that another request joins has its chain completed to K before its first shared round.
+- Drafts only: the target decides every token, but the verify's row count varies (2..kmax + 1) as a DFlash2 round's
+  does. Off, the planner's steps are unchanged with or without the log-probability hook (`batch_kstop_test`).
+- `G6_MTP_LPLOG=1` prints one `# kstop` line per solo round on rank 0 (the drafts' log-probabilities, the verified and
+  accepted counts), for tuning the thresholds offline. It changes nothing else.
+
+## 2026-10-16: DFlash2 after a prefix-reuse hit, and for a request left alone on MTP (G6_DFL_REUSE, off by default)
+
+- KNOWN-ISSUES #1: at TP=4 a request whose prefix-reuse hit skipped into the drafter's 2,048-position window, or that
+  was not alone at its prompt tail, ran MTP for its whole life. That is most later turns of a conversation.
+  `G6_DFL_REUSE=1` lets the hit request keep the drafter: the drafter's context starts past the hit's rows, or at the
+  window's start when its KV ring still holds the previous turn of the same conversation (S2 tracks which tokens the
+  ring's rows belong to). With fewer than `G6_DFL_REUSE_MIN` (256) context rows the request runs MTP rounds that feed
+  the drafter until it holds that many, then drafts with DFlash2. `G6_DFL_REUSE=2` also gives the drafter to a request
+  that runs alone on MTP, from its last token, the same way.
+- Drafts only: the target decides every token. Unset, no step changes. A session that starts its warm-up on MTP has
+  its chain drafted at admit, so its first MTP round verifies K drafts. Host test: `batch_dflreuse_test`.
+- With it on, rank 0 prints a `# s2 dflash reuse slot` line for every request: rounds on each drafter, where the
+  context started, the warm-up and the promotion, so a request that never had DFlash2 shows too.
+## 2026-10-16: the fabric's queue pairs take the ports' active MTU, not 4096
+- Every RDMA queue pair was moved to RTR with `path_mtu = IBV_MTU_4096`, whatever the port could carry. On a switched
+  RoCE fabric whose interfaces run a 1500-byte MTU the ports' active MTU is 1024, and the first boot failed with an S2
+  prefill fabric error. With this change the same cluster boots and serves at 1500.
+- Each rail now reads its port's active MTU at init (`ibv_query_port`) and sends it with its QP in the bootstrap; each
+  connection takes the lower of the two ends' values, as the KV node's verbs code already does
+  (`engine/kvman-rs/src/remote/verbs.rs`). After RTS the QP is read back and its path MTU checked, and every rail and QP
+  logs its MTU.
+- Ports at 4096 behave as before. The bootstrap's `QPInfo` grows one field, so every rank must run the same build (the
+  launcher's handshake compares engine builds already). `fabric_mtu_test` (host) checks the choice.
+
+## 2026-10-16: a CI runner for each KV format, and fewer widths on a pull request
+
+- The engine job was the whole critical path of a 22-minute run: 1,187 s, with the fp8 and the int4 stage competing for
+  one runner's four cores for most of it (int4 finished at 551 s, fp8 at about 1,000 s). They share no compilation, so
+  each has a runner now. `dist` splits into `dist-fp8` and `dist-int4`, which are what the two jobs export, and stays
+  the union of them, so `docker build --target dist -o out .` is unchanged.
+- A pull request compiles three TP widths instead of six: 1, the `PF_F12` width 4, and the largest. A binary that lacks
+  a width names the ones it has when asked for another (`engine/runtime/widths.cpp`), so an artifact built this way
+  cannot quietly fail a TP=3 run. `main` and tags still compile all six.
+- One leg exports the build cache for both, rather than a scope each. This repo's Actions cache was at 10.29 GiB
+  against a 10 GB cap and evicting, which is why the cargo and loader stages had been rebuilding on runs that should
+  have hit them.
+
+## 2026-10-16: g6m4 and m4sim parse their shared flags in one place
+
+- The real engine and the reference driver take 29 of the same flags, and m4sim's output is the oracle g6m4 is held to,
+  but each main held its own copy of the parse lines: 171 identical lines between them, 103 of them substantial. They
+  now come from `engine/runtime/engine_opts.h`, which is host-only, so `engine_opts_test` checks every shared flag, the
+  bounds both mains checked (`--chunk`, `--mtp`) and the two bad values (`--v2-dense-form`, `--spec-accept`) under g++
+  (`scripts/host_tests.sh`). Nothing about the flags changed: `--layers` still defaults to the same four layers, the
+  flags that land in `Plan` are applied only when the command line names them so `Plan` keeps its own defaults, and the
+  flags each main owns alone are untouched.
+
+## 2026-10-15: one engine binary for every TP width
+
+- `scripts/build.sh` builds one `g6m4` and one `m4sim` that run TP = 1, 2, 3, 4, 6 and 8 (and with `KV_FORMAT=int4`
+  one `g6m4-int4`). `g6m4` takes the width from `--ips`; `m4sim` from `--tp N`, else from the rank packs in
+  `--packs DIR`. Each width is compiled as its one-width build was (`DEC_S2` at every width, `PF_F12` at 4) into its
+  own instance in the binary (`engine/runtime/build_m4.sh`), so its kernels are byte for byte the ones that build had.
+- `G6_WIDTHS="3 4"` builds only those widths, and `G6_NR=4` only TP=4. `./gr8 glm53 build` no longer needs the TP. The
+  image and the tester zip ship `bin/` alone (the image keeps `bin3/` and `bin6/` as links to it, which
+  `docker/entrypoint.sh` still picks from), and the handshake's engine hash is the same at every width.
+- `dtr_test` is `dtr_test_tp<N>`, one per width.
+
+## 2026-10-15: the tool-call parser stops reading prose as calls, and the Python front end is gone
+
+- The GLM parser searched the whole reply for the tool-call tags, so a reply that *wrote about* a call was taken for one:
+  an example in the answer became a real `tool_calls` entry (and in reasoning it ended the reasoning, moving the text
+  around it), an opener with no closer swallowed everything after it, a `</tool_call>` inside an `<arg_value>` cut the
+  call short and leaked the rest of the format into the content, and a call naming a tool the request did not offer
+  vanished from the text instead of staying prose. Those are one bug: the tags meant something wherever they appeared.
+- A run of the reply from a `<tool_call>` on is now held and decided as a whole. It is a call only when the reply ends
+  with it — a call the model makes is its last segment, and it stops right after `</tool_call>` — and text again when
+  anything else follows: prose, a code fence's closing backticks, a `</think>`. As text its raw bytes go back where they
+  came from, so nothing is lost and reasoning that quoted an example stays reasoning. An opener right after a backtick is
+  inline code; a closer inside an `<arg_value>` is part of the value (the format has no escape); an unterminated call, or
+  one naming a tool the request did not offer, is prose.
+- The visible cost is the streaming cadence for calls: their deltas go out when the run is decided rather than as it is
+  written, because a call that turns out to be prose cannot be taken back from a client. The final text and arguments are
+  identical, and the README says so where it described the old per-key streaming.
+- The Python front end (`frontend/g6front/`) is removed. `./gr8 glm53 up` runs `g6front-rs`, and the Python one was a
+  second implementation of this same parser that a change like this would have had to keep in step byte for byte; its
+  only consumers were `tests/diff_fronts.py`, `tests/bench_fronts.py` and `tests/test_parser.py`, removed with it.
+  `wire.py` and `tokenizer.py` move up to `frontend/` for the shim, the mock engine and the shim tests, which stay, and
+  `requirements.txt` is the tokenizer alone. The parser's tests are the Rust front end's now (11 new, 48 in all), and
+  `frontend/tests/test_api.py` covers the HTTP path against the mock engine.
 ## 2026-10-14: a notice targets the work in flight, not a constant eight boundaries
 
 - The first hardware trace of the event log says what #61's remaining delay is: the cancel anchored at boundary 8 landed

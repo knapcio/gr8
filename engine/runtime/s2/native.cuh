@@ -21,9 +21,10 @@ inline long long s2_wall_ms() {
 // host clock on entry, before and after its graph launch
 // and after its fence, and records a CUDA event before and after its graph(s). After the fence it adds the step to its
 // kind's totals (GPU span = event to event; host input prep, launch call, fence wait) and the transition from the step
-// before to that pair's totals (GPU idle = the previous step's end event to this step's start event; host = the previous
-// fence to this launch's entry: accept, emit, drafter choice, step planning). Prints them every N main steps. The idle
-// time is what launching the next step from the GPU could remove; the spans stay. Also the mean span per kind and row
+// before to that pair's totals (the main-stream gap = the previous step's end event to this step's start event, both on the main stream; host = the previous
+// fence to this launch's entry: accept, emit, drafter choice, step planning). Prints them every N main steps. The gap is
+// bounded by the main stream's events: with G6_DRAFT_PAR the drafter's side stream can run inside it, so it is an upper
+// bound on what launching the next step from the GPU could remove; the spans stay. Also the mean span per kind and row
 // count (tools/s2_dsel_table.py turns them into the drafter choice's cost table). Unset: no events, no stamps.
 // G6_DRAFT_PAR: a solo DFlash2 round's drafter step (launched before the first form on its own stream, waited for after
 // the first form and the chain) counts as dfl_ctx_par / dfl_query_par through par_*, with its own event pair: span = its
@@ -69,17 +70,6 @@ struct S2Timeline {
         float s = 0; G6RT_CK(cudaEventElapsedTime(&s, evp[0], evp[1]));
         ++n[kind]; rows[kind] += M; span[kind] += s; prep[kind] += ms(p_enter, p_pre); call[kind] += ms(p_pre, p_post); wait[kind] += ms(p_wait, t);
         if (M >= 1 && M <= MR) { ++nm[kind][M]; sm[kind][M] += s; }
-    }
-    // not a decode transition: a prefill quantum, a mode switch, the drafter's prompt fill
-    void cut() { have_prev = false; }
-    // after the step's fence
-    void done(int kind, int M, int rank) {
-        if (!on()) return;
-        const auto t = clk::now();
-        float s = 0; G6RT_CK(cudaEventElapsedTime(&s, ev[cur][0], ev[cur][1]));
-        ++n[kind]; rows[kind] += M; span[kind] += s; prep[kind] += ms(t_enter, t_pre); call[kind] += ms(t_pre, t_post); wait[kind] += ms(t_post, t);
-        if (M >= 1 && M <= MR) { ++nm[kind][M]; sm[kind][M] += s; }
-        if (have_prev) {
             float g = 0; G6RT_CK(cudaEventElapsedTime(&g, ev[cur ^ 1][1], ev[cur][0]));
             if (g > 20.f) ++breaks;      // an event fence or an idle engine in between, not a round's transition
             else { ++tn[prev_kind][kind]; idle[prev_kind][kind] += g; host[prev_kind][kind] += ms(t_prev, t_enter); }
@@ -92,7 +82,7 @@ struct S2Timeline {
         for (int a = 0; a < NK; ++a) for (int b = 0; b < NK; ++b) { ti += idle[a][b]; th += host[a][b]; }
         for (int k = 1; k < NK; ++k) ds += span[k];
         const double m = double(mains);
-        fprintf(stderr, "# s2_tl rank %d mains %ld: per main step: GPU idle %.3f ms (host between steps %.3f), drafting GPU span %.3f ms, breaks %ld\n",
+        fprintf(stderr, "# s2_tl rank %d mains %ld: per main step: main-stream gap %.3f ms (host between steps %.3f; with G6_DRAFT_PAR the drafter's side stream may run inside the gap), drafting GPU span %.3f ms, breaks %ld\n",
                 rank, mains, ti / m, th / m, ds / m, breaks);
         for (int k = 0; k < NK; ++k)
             if (n[k])
